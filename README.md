@@ -22,15 +22,29 @@ Think of it as **local Codespaces on your phone**.
 
 ```text
 ┌──────────────────────────────────────────────┐
-│               Termux (Android)              │
+│               Termux (Android)               │
 │                                              │
-│   ┌───────────┐  ┌───────────┐  ┌─────────┐ │
+│   ┌───────────┐  ┌───────────┐  ┌──────────┐ │
 │   │ Ubuntu #1 │  │ Ubuntu #2 │  │ Ubuntu #3│ │
 │   │ port 2000 │  │ port 2001 │  │ port 2002│ │
-│   └───────────┘  └───────────┘  └─────────┘ │
+│   └───────────┘  └───────────┘  └──────────┘ │
 │         proot          proot          proot │
 └──────────────────────────────────────────────┘
 ```
+
+## Why use this?
+
+When you develop directly on your main machine, project dependencies, libraries, and extra packages can slowly mess up your system. Different projects often need different versions of the same tools, and that can turn into conflicts very fast.
+
+TermuxCodeSpace solves that by giving each project its own isolated Ubuntu environment.
+
+It is useful because:
+
+* your main system stays clean
+* every project gets its own separate packages and libraries
+* you can test different setups without breaking anything else
+* it runs directly on your phone with Termux
+* it is lightweight, portable, and easy to launch anywhere
 
 ## Features
 
