@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # =============================================================================
-# Termux CodeSpace — single-file edition (v4 — definitive fix)
+# Termux CodeSpace — single-file edition
 # Made By Aryan Giri | giriaryan694-a11y
 #
 # Manages multiple isolated Ubuntu environments in Termux via proot, each
@@ -11,8 +11,6 @@ set -uo pipefail
 
 # ================================================================== #
 # CRITICAL: Disable termux-exec BEFORE anything else.
-# proot-distro v5 source: child_env.pop("LD_PRELOAD", None)
-# Ref: https://github.com/termux/termux-packages/issues/2066
 # ================================================================== #
 unset LD_PRELOAD
 
@@ -28,7 +26,6 @@ PROOT_DISTRO_DIR="$PREFIX/var/lib/proot-distro"
 BASE_ROOTFS_V5="$PROOT_DISTRO_DIR/containers/ubuntu/rootfs"
 BASE_ROOTFS_V4="$PROOT_DISTRO_DIR/installed-rootfs/ubuntu"
 
-# Full path to proot binary (avoid PATH search issues)
 PROOT_BIN="$PREFIX/bin/proot"
 
 detect_base_rootfs() {
@@ -54,10 +51,6 @@ BOLD='\033[1m'
 RESET='\033[0m'
 
 mkdir -p "$CODESPACES_DIR" "$META_DIR"
-
-# ================================================================== #
-# CRITICAL: Ensure proot's temp directory exists.
-# ================================================================== #
 mkdir -p "$PREFIX/tmp"
 
 # ------------------------------------------------------------------ #
@@ -234,8 +227,10 @@ run_initial_setup() {
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt update
-    apt install -y sudo curl wget git python3 python3-pip ca-certificates
+    apt install -y sudo curl wget git python3 python3-pip ca-certificates bash
     apt upgrade -y
+    # Ensure bash is the default shell for root
+    chsh -s /bin/bash root 2>/dev/null || true
   '
 
   echo -e "${CYAN}[*] Installing code-server...${RESET}"
@@ -244,6 +239,33 @@ run_initial_setup() {
     export DEBIAN_FRONTEND=noninteractive
     curl -fsSL https://code-server.dev/install.sh | sh
     mkdir -p /root/.config/code-server
+  '
+
+  # ----------------------------------------------------------
+  # NEW: Write code-server settings.json with explicit terminal
+  # profile so VS Code knows exactly which shell to use.
+  # Without this, VS Code auto-detects and fails in proot.
+  # ----------------------------------------------------------
+  echo -e "${CYAN}[*] Configuring code-server terminal profile...${RESET}"
+  proot-distro login ubuntu -- bash -c '
+    mkdir -p /root/.local/share/code-server/User
+    cat > /root/.local/share/code-server/User/settings.json <<SETTINGS
+{
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.profiles.linux": {
+    "bash": {
+      "path": "/bin/bash",
+      "args": ["-l"]
+    },
+    "sh": {
+      "path": "/bin/sh"
+    }
+  },
+  "terminal.integrated.env.linux": {
+    "SHELL": "/bin/bash"
+  }
+}
+SETTINGS
   '
 
   echo -e "${CYAN}[*] Reading the generated password (if any)...${RESET}"
@@ -332,12 +354,51 @@ fix_l2s_symlinks() {
 
 # ================================================================== #
 # prepare_codespace_rootfs — create required directories
+#
+# proot-distro v5 creates these upfront:
+#   - $ROOTFS/.l2s    (PROOT_L2S_DIR)
+#   - $ROOTFS/tmp     (bound as /dev/shm, chmod 1777)
+#   - $ROOTFS/dev/pts (PTY slave devices for terminal support)
 # ================================================================== #
 prepare_codespace_rootfs() {
   local rootfs="$1"
   mkdir -p "$rootfs/.l2s"
   mkdir -p "$rootfs/tmp"
   chmod 1777 "$rootfs/tmp" 2>/dev/null || true
+  # NEW: Ensure /dev/pts exists for terminal PTY allocation
+  mkdir -p "$rootfs/dev/pts"
+  mkdir -p "$rootfs/dev/shm"
+  mkdir -p "$rootfs/run"
+}
+
+# ================================================================== #
+# write_codeserver_settings — write terminal profile settings.json
+#
+# Without an explicit terminal profile, VS Code auto-detects
+# shells and fails in proot with "execvp(3) failed".
+# Ref: https://github.com/microsoft/vscode/issues/103962
+# ================================================================== #
+write_codeserver_settings() {
+  local rootfs="$1"
+  local settings_dir="$rootfs/root/.local/share/code-server/User"
+  mkdir -p "$settings_dir"
+  cat > "$settings_dir/settings.json" <<'SETTINGS'
+{
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.profiles.linux": {
+    "bash": {
+      "path": "/bin/bash",
+      "args": ["-l"]
+    },
+    "sh": {
+      "path": "/bin/sh"
+    }
+  },
+  "terminal.integrated.env.linux": {
+    "SHELL": "/bin/bash"
+  }
+}
+SETTINGS
 }
 
 create_codespace() {
@@ -372,6 +433,9 @@ create_codespace() {
 
   fix_l2s_symlinks "$BASE_ROOTFS" "$CODESPACES_DIR/$name"
   prepare_codespace_rootfs "$CODESPACES_DIR/$name"
+
+  # NEW: Ensure terminal settings exist in the clone
+  write_codeserver_settings "$CODESPACES_DIR/$name"
 
   local port
   port=$(find_free_port "$req_port")
@@ -421,6 +485,7 @@ start_codespace() {
     echo -e "${CYAN}[*] Starting code-server for '$name' on port $port...${RESET}"
 
     prepare_codespace_rootfs "$rootfs"
+    write_codeserver_settings "$rootfs"
 
     local launcher="$META_DIR/$name.launcher.sh"
     cat > "$launcher" <<LAUNCHER_EOF
@@ -428,7 +493,7 @@ start_codespace() {
 # Auto-generated launcher for codespace '$name' — do not edit
 set -uo pipefail
 
-# CRITICAL: disable termux-exec (proot-distro v5: child_env.pop("LD_PRELOAD"))
+# CRITICAL: disable termux-exec
 unset LD_PRELOAD
 
 # Ensure proot temp dir exists
@@ -437,6 +502,7 @@ mkdir -p "$PREFIX/tmp"
 # --- Environment (matches proot-distro v5 _build_normal_env) ---
 export HOME=/root
 export USER=root
+export SHELL=/bin/bash
 export TERM="${TERM:-xterm-256color}"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PREFIX/bin"
 export LANG=C.UTF-8
@@ -448,7 +514,7 @@ export PROOT_L2S_DIR="$rootfs/.l2s"
 # export PROOT_VERBOSE=9
 # export PROOT_NO_SECCOMP=1
 
-# --- Launch proot with full path (no PATH search, no env command) ---
+# --- Launch proot with full path ---
 exec "$PROOT_BIN" \\
   --kill-on-exit \\
   --link2symlink \\
