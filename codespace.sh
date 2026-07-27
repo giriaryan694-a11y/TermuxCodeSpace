@@ -178,6 +178,119 @@ find_free_port() {
   return 1
 }
 
+# ================================================================== #
+# harden_proot_ubuntu — fix sudo + systemd for proot environment
+#
+# Called via `proot-distro login ubuntu -- bash -c '...'` on the
+# BASE image during setup, and also applied to clones.
+#
+# Fixes:
+#   1. sudo "no new privileges" — restore SUID bit + add wrapper
+#      Ref: https://github.com/termux/proot-distro/issues/533
+#   2. systemd "Failed to seek /etc/machine-id" — pre-create
+#      machine-id, stub postinst scripts, policy-rc.d, apt hold
+#      Ref: https://github.com/sabamdarif/termux-desktop/issues/306
+#   3. debconf "No usable dialog-like program" — install dialog
+# ================================================================== #
+harden_proot_ubuntu() {
+  proot-distro login ubuntu -- bash -c '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --------------------------------------------------------
+    # 1. PRE-CREATE /etc/machine-id BEFORE any apt operation
+    #    systemd-machine-id-setup calls lseek() on this file
+    #    which proot cannot emulate. If the file already exists
+    #    with a valid UUID, systemd skips the seek entirely.
+    # --------------------------------------------------------
+    if [[ ! -s /etc/machine-id ]]; then
+      cat /proc/sys/kernel/random/uuid | tr -d "-" > /etc/machine-id
+    fi
+
+    # --------------------------------------------------------
+    # 2. PREVENT SERVICES FROM STARTING (no init in proot)
+    #    policy-rc.d returning 101 tells dpkg to skip all
+    #    invoke-rc.d / service start calls.
+    # --------------------------------------------------------
+    cat > /usr/sbin/policy-rc.d << "POLICYEOF"
+#!/bin/sh
+exit 101
+POLICYEOF
+    chmod +x /usr/sbin/policy-rc.d
+
+    # --------------------------------------------------------
+    # 3. STUB OUT SYSTEMD POSTINST SCRIPTS
+    #    These scripts call systemd-machine-id-setup, systemctl,
+    #    etc. which all fail in proot. Replace with no-ops.
+    # --------------------------------------------------------
+    for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
+               systemd-cryptsetup libsystemd-shared libpam-systemd \
+               libnss-systemd dbus dbus-user-session; do
+      script="/var/lib/dpkg/info/${pkg}.postinst"
+      if [[ -f "$script" ]]; then
+        echo "#!/bin/sh" > "$script"
+        echo "exit 0"   >> "$script"
+      fi
+    done
+
+    # --------------------------------------------------------
+    # 4. FIX BROKEN DPKG STATE (if any)
+    # --------------------------------------------------------
+    dpkg --configure --force-all -a 2>/dev/null || true
+    apt --fix-broken install -y 2>/dev/null || true
+
+    # --------------------------------------------------------
+    # 5. HOLD SYSTEMD PACKAGES so apt never tries to
+    #    configure them again during future installs
+    # --------------------------------------------------------
+    apt-mark hold systemd systemd-sysv systemd-timesyncd \
+      systemd-resolved systemd-cryptsetup libsystemd-shared \
+      libpam-systemd libnss-systemd 2>/dev/null || true
+
+    # --------------------------------------------------------
+    # 6. FIX SUDO for proot
+    #    Android sets no_new_privs on all processes.
+    #    sudo checks this flag ONLY when geteuid() != 0.
+    #    proot does not track file owners, so exec of a SUID
+    #    binary always sets euid to root. Restoring the SUID
+    #    bit makes sudo see euid=0 and skip the check.
+    #    Ref: https://github.com/termux/proot-distro/issues/533
+    # --------------------------------------------------------
+    if command -v sudo >/dev/null 2>&1; then
+      chmod u+s "$(command -v sudo)" 2>/dev/null || true
+    fi
+
+    # Also create a wrapper as a belt-and-suspenders fallback.
+    # In proot with --change-id=0:0 we are ALWAYS root, so
+    # sudo just needs to exec the command directly.
+    mkdir -p /usr/local/bin
+    cat > /usr/local/bin/sudo << "SUDOEOF"
+#!/bin/bash
+# proot sudo shim — we are already root via --change-id=0:0
+# Strip common sudo flags and exec the command directly.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|-g|-C|-p) shift 2 ;;   # options that take an argument
+    --)          shift; break ;;
+    -*)          shift ;;      # flags without arguments (-i, -s, -E, etc.)
+    *)           break ;;      # first non-option = the command
+  esac
+done
+exec "$@"
+SUDOEOF
+    chmod +x /usr/local/bin/sudo
+
+    # --------------------------------------------------------
+    # 7. MASK SYSTEMD UNITS that would fail if triggered
+    # --------------------------------------------------------
+    mkdir -p /etc/systemd/system
+    for unit in systemd-resolved systemd-timesyncd systemd-networkd \
+                getty@tty1 remote-fs systemd-pstore; do
+      ln -sf /dev/null "/etc/systemd/system/${unit}.service" 2>/dev/null || true
+    done
+  '
+}
+
 # ------------------------------------------------------------------ #
 # One-time base Ubuntu setup
 # ------------------------------------------------------------------ #
@@ -222,15 +335,30 @@ run_initial_setup() {
   echo -e "${GREEN}[*] Ubuntu rootfs found at: $BASE_ROOTFS${RESET}"
   echo
 
+  # ----------------------------------------------------------
+  # CRITICAL: Harden the environment BEFORE any apt install.
+  # This pre-creates /etc/machine-id, stubs systemd postinst
+  # scripts, adds policy-rc.d, and fixes sudo.
+  # Without this, any apt install that pulls in systemd as a
+  # dependency will fail with "Failed to seek /etc/machine-id".
+  # ----------------------------------------------------------
+  echo -e "${CYAN}[*] Hardening proot environment (sudo, systemd, machine-id)...${RESET}"
+  harden_proot_ubuntu
+
   echo -e "${CYAN}[*] Updating packages and installing base tooling...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt update
-    apt install -y sudo curl wget git python3 python3-pip ca-certificates bash
+    apt install -y dialog sudo curl wget git python3 python3-pip \
+      ca-certificates bash lsb-release
     apt upgrade -y
     # Ensure bash is the default shell for root
     chsh -s /bin/bash root 2>/dev/null || true
+    # Re-fix sudo SUID bit (apt upgrade may have reset it)
+    chmod u+s "$(command -v sudo)" 2>/dev/null || true
+    # Fix any dpkg breakage from the upgrade
+    dpkg --configure --force-all -a 2>/dev/null || true
   '
 
   echo -e "${CYAN}[*] Installing code-server...${RESET}"
@@ -239,12 +367,13 @@ run_initial_setup() {
     export DEBIAN_FRONTEND=noninteractive
     curl -fsSL https://code-server.dev/install.sh | sh
     mkdir -p /root/.config/code-server
+    # Fix dpkg state after code-server install (it may pull deps)
+    dpkg --configure --force-all -a 2>/dev/null || true
   '
 
   # ----------------------------------------------------------
-  # NEW: Write code-server settings.json with explicit terminal
+  # Write code-server settings.json with explicit terminal
   # profile so VS Code knows exactly which shell to use.
-  # Without this, VS Code auto-detects and fails in proot.
   # ----------------------------------------------------------
   echo -e "${CYAN}[*] Configuring code-server terminal profile...${RESET}"
   proot-distro login ubuntu -- bash -c '
@@ -354,29 +483,55 @@ fix_l2s_symlinks() {
 
 # ================================================================== #
 # prepare_codespace_rootfs — create required directories
-#
-# proot-distro v5 creates these upfront:
-#   - $ROOTFS/.l2s    (PROOT_L2S_DIR)
-#   - $ROOTFS/tmp     (bound as /dev/shm, chmod 1777)
-#   - $ROOTFS/dev/pts (PTY slave devices for terminal support)
 # ================================================================== #
 prepare_codespace_rootfs() {
   local rootfs="$1"
   mkdir -p "$rootfs/.l2s"
   mkdir -p "$rootfs/tmp"
   chmod 1777 "$rootfs/tmp" 2>/dev/null || true
-  # NEW: Ensure /dev/pts exists for terminal PTY allocation
   mkdir -p "$rootfs/dev/pts"
   mkdir -p "$rootfs/dev/shm"
   mkdir -p "$rootfs/run"
+
+  # Ensure machine-id exists in the clone (in case base was set up
+  # before v4.3, or the clone somehow lost it)
+  if [[ ! -s "$rootfs/etc/machine-id" ]]; then
+    cat /proc/sys/kernel/random/uuid | tr -d '-' > "$rootfs/etc/machine-id"
+  fi
+
+  # Ensure policy-rc.d exists in the clone
+  if [[ ! -f "$rootfs/usr/sbin/policy-rc.d" ]]; then
+    printf '#!/bin/sh\nexit 101\n' > "$rootfs/usr/sbin/policy-rc.d"
+    chmod +x "$rootfs/usr/sbin/policy-rc.d"
+  fi
+
+  # Ensure sudo SUID bit is set in the clone
+  if [[ -f "$rootfs/usr/bin/sudo" ]]; then
+    chmod u+s "$rootfs/usr/bin/sudo" 2>/dev/null || true
+  fi
+
+  # Ensure sudo wrapper exists in the clone
+  if [[ ! -f "$rootfs/usr/local/bin/sudo" ]]; then
+    mkdir -p "$rootfs/usr/local/bin"
+    cat > "$rootfs/usr/local/bin/sudo" << 'SUDOEOF'
+#!/bin/bash
+# proot sudo shim — we are already root via --change-id=0:0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|-g|-C|-p) shift 2 ;;
+    --)          shift; break ;;
+    -*)          shift ;;
+    *)           break ;;
+  esac
+done
+exec "$@"
+SUDOEOF
+    chmod +x "$rootfs/usr/local/bin/sudo"
+  fi
 }
 
 # ================================================================== #
 # write_codeserver_settings — write terminal profile settings.json
-#
-# Without an explicit terminal profile, VS Code auto-detects
-# shells and fails in proot with "execvp(3) failed".
-# Ref: https://github.com/microsoft/vscode/issues/103962
 # ================================================================== #
 write_codeserver_settings() {
   local rootfs="$1"
@@ -433,8 +588,6 @@ create_codespace() {
 
   fix_l2s_symlinks "$BASE_ROOTFS" "$CODESPACES_DIR/$name"
   prepare_codespace_rootfs "$CODESPACES_DIR/$name"
-
-  # NEW: Ensure terminal settings exist in the clone
   write_codeserver_settings "$CODESPACES_DIR/$name"
 
   local port
