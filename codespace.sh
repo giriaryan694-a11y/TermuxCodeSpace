@@ -179,35 +179,107 @@ find_free_port() {
 }
 
 # ================================================================== #
-# harden_proot_ubuntu — fix sudo + systemd for proot environment
+# harden_proot_ubuntu — make Ubuntu safe for proot
 #
-# MUST run BEFORE any apt install that could pull systemd deps.
+# Uses dpkg-divert to permanently redirect systemd binaries.
+# Unlike postinst stubbing (which dpkg overwrites on unpack),
+# diversions are stored in dpkg's database and respected for
+# ALL future installs AND upgrades.
 #
-# Fixes:
-#   1. Pre-create /etc/machine-id (systemd lseek fails in proot)
-#   2. policy-rc.d exit 101 (no init system in proot)
-#   3. Stub systemd postinst scripts (no-op)
-#   4. dpkg --configure --force-all (fix broken state)
-#   5. apt-mark hold systemd packages
-#   6. chmod u+s sudo (bypass no_new_privs check)
-#   7. sudo wrapper shim (belt-and-suspenders)
-#   8. Mask systemd units
+# Ref: https://man7.org/linux/man-pages/man1/dpkg-divert.1.html
+# Ref: https://github.com/sabamdarif/termux-desktop/issues/306
 # ================================================================== #
 harden_proot_ubuntu() {
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
 
-    # 1. PRE-CREATE /etc/machine-id
+    # ============================================================
+    # 1. PRE-CREATE /etc/machine-id with valid UUID + newline
+    # ============================================================
     if [[ ! -s /etc/machine-id ]]; then
-      cat /proc/sys/kernel/random/uuid | tr -d "-" > /etc/machine-id
+      echo "$(cat /proc/sys/kernel/random/uuid | tr -d "-")" > /etc/machine-id
     fi
 
-    # 2. PREVENT SERVICES FROM STARTING
+    # ============================================================
+    # 2. PREVENT SERVICES FROM STARTING (no init in proot)
+    # ============================================================
     printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
     chmod +x /usr/sbin/policy-rc.d
 
-    # 3. STUB SYSTEMD POSTINST SCRIPTS
+    # ============================================================
+    # 3. dpkg-divert SYSTEMD BINARIES
+    #
+    # This is the KEY fix. dpkg-divert registers a permanent
+    # redirect in dpkg database. When ANY package (new install
+    # or upgrade) tries to install these files, dpkg puts the
+    # real binary at the .real path and leaves our fake in place.
+    #
+    # Unlike stubbing postinst scripts (which dpkg overwrites
+    # during unpack), diversions survive everything.
+    # ============================================================
+    divert_binary() {
+      local binpath="$1"
+      local divert="${binpath}.real"
+      # Register diversion (--rename moves existing file if present)
+      if [[ -f "$binpath" && ! -L "$binpath" ]]; then
+        dpkg-divert --add --rename --divert "$divert" "$binpath" 2>/dev/null || true
+      else
+        dpkg-divert --add --divert "$divert" "$binpath" 2>/dev/null || true
+      fi
+    }
+
+    # The binaries that systemd postinst calls and that fail in proot:
+    divert_binary /usr/bin/systemd-machine-id-setup
+    divert_binary /bin/systemctl
+    divert_binary /usr/bin/systemctl
+    divert_binary /usr/bin/systemd-sysusers
+    divert_binary /usr/bin/systemd-tmpfiles
+    divert_binary /usr/lib/systemd/systemd-sysusers
+    divert_binary /usr/lib/systemd/systemd-tmpfiles
+    divert_binary /usr/bin/systemd-firstboot
+    divert_binary /usr/lib/systemd/systemd-network-generator
+
+    # Create fake no-op scripts at the original paths
+    for binpath in \
+      /usr/bin/systemd-machine-id-setup \
+      /bin/systemctl \
+      /usr/bin/systemctl \
+      /usr/bin/systemd-sysusers \
+      /usr/bin/systemd-tmpfiles \
+      /usr/lib/systemd/systemd-sysusers \
+      /usr/lib/systemd/systemd-tmpfiles \
+      /usr/bin/systemd-firstboot \
+      /usr/lib/systemd/systemd-network-generator; do
+      mkdir -p "$(dirname "$binpath")"
+      cat > "$binpath" << "FAKEBIN"
+#!/bin/sh
+# proot shim — systemd binaries do not work under proot.
+# This no-op replacement prevents postinst failures.
+# Ref: https://github.com/sabamdarif/termux-desktop/issues/306
+exit 0
+FAKEBIN
+      chmod +x "$binpath"
+    done
+
+    # Special case: systemd-machine-id-setup should ensure machine-id exists
+    cat > /usr/bin/systemd-machine-id-setup << "MIDEOF"
+#!/bin/sh
+# proot shim for systemd-machine-id-setup
+# Ensures /etc/machine-id exists with a valid UUID, then exits.
+# The real binary calls lseek() which proot cannot emulate.
+if [ ! -s /etc/machine-id ]; then
+  echo "$(cat /proc/sys/kernel/random/uuid | tr -d "-")" > /etc/machine-id
+fi
+exit 0
+MIDEOF
+    chmod +x /usr/bin/systemd-machine-id-setup
+
+    # ============================================================
+    # 4. STUB POSTINST SCRIPTS (belt-and-suspenders)
+    #    These WILL be overwritten by dpkg unpack, but the
+    #    diverted binaries above prevent the actual failure.
+    # ============================================================
     for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
                systemd-cryptsetup libsystemd-shared libpam-systemd \
                libnss-systemd dbus dbus-user-session; do
@@ -217,21 +289,26 @@ harden_proot_ubuntu() {
       fi
     done
 
-    # 4. FIX BROKEN DPKG STATE
+    # ============================================================
+    # 5. FIX BROKEN DPKG STATE (if any from previous attempts)
+    # ============================================================
     dpkg --configure --force-all -a 2>/dev/null || true
     apt --fix-broken install -y 2>/dev/null || true
 
-    # 5. HOLD SYSTEMD PACKAGES
+    # ============================================================
+    # 6. HOLD SYSTEMD PACKAGES (prevent future upgrades)
+    # ============================================================
     apt-mark hold systemd systemd-sysv systemd-timesyncd \
       systemd-resolved systemd-cryptsetup libsystemd-shared \
       libpam-systemd libnss-systemd 2>/dev/null || true
 
-    # 6. FIX SUDO SUID BIT
+    # ============================================================
+    # 7. FIX SUDO for proot
+    # ============================================================
     if command -v sudo >/dev/null 2>&1; then
       chmod u+s "$(command -v sudo)" 2>/dev/null || true
     fi
 
-    # 7. SUDO WRAPPER SHIM
     mkdir -p /usr/local/bin
     cat > /usr/local/bin/sudo << "SUDOEOF"
 #!/bin/bash
@@ -248,12 +325,51 @@ exec "$@"
 SUDOEOF
     chmod +x /usr/local/bin/sudo
 
+    # ============================================================
     # 8. MASK SYSTEMD UNITS
+    # ============================================================
     mkdir -p /etc/systemd/system
     for unit in systemd-resolved systemd-timesyncd systemd-networkd \
                 getty@tty1 remote-fs systemd-pstore; do
       ln -sf /dev/null "/etc/systemd/system/${unit}.service" 2>/dev/null || true
     done
+  '
+}
+
+# ================================================================== #
+# post_apt_fix — safety net after EVERY apt operation
+#
+# dpkg unpack replaces postinst scripts with the real ones from
+# the .deb. This function re-stubs them and re-fixes sudo.
+# The dpkg-diverted binaries (from harden_proot_ubuntu) are the
+# real protection; this is just belt-and-suspenders.
+# ================================================================== #
+post_apt_fix() {
+  proot-distro login ubuntu -- bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Re-stub postinst scripts (dpkg unpack may have replaced them)
+    for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
+               systemd-cryptsetup libsystemd-shared libpam-systemd \
+               libnss-systemd dbus dbus-user-session; do
+      script="/var/lib/dpkg/info/${pkg}.postinst"
+      if [[ -f "$script" ]]; then
+        printf "#!/bin/sh\nexit 0\n" > "$script"
+      fi
+    done
+
+    # Fix any broken dpkg state
+    dpkg --configure --force-all -a 2>/dev/null || true
+
+    # Re-fix sudo SUID bit (apt may have reset it)
+    if command -v sudo >/dev/null 2>&1; then
+      chmod u+s "$(command -v sudo)" 2>/dev/null || true
+    fi
+
+    # Re-hold systemd packages
+    apt-mark hold systemd systemd-sysv systemd-timesyncd \
+      systemd-resolved systemd-cryptsetup libsystemd-shared \
+      libpam-systemd libnss-systemd 2>/dev/null || true
   '
 }
 
@@ -306,8 +422,12 @@ run_initial_setup() {
 
   # ============================================================== #
   # STEP 2: Harden proot environment (BEFORE any apt install)
+  #
+  # dpkg-divert systemd binaries so that when ANY future apt
+  # operation installs/upgrades systemd, the real binaries go
+  # to .real paths and our no-op fakes stay in place.
   # ============================================================== #
-  echo -e "${CYAN}[*] Hardening proot environment (sudo, systemd, machine-id)...${RESET}"
+  echo -e "${CYAN}[*] Hardening proot environment (dpkg-divert, sudo, machine-id)...${RESET}"
   harden_proot_ubuntu
 
   # ============================================================== #
@@ -328,22 +448,11 @@ run_initial_setup() {
       build-essential pkg-config
     apt upgrade -y
     chsh -s /bin/bash root 2>/dev/null || true
-    chmod u+s "$(command -v sudo)" 2>/dev/null || true
-    dpkg --configure --force-all -a 2>/dev/null || true
   '
+  post_apt_fix
 
   # ============================================================== #
   # STEP 4: Common dev & GUI / Electron / Chromium libraries
-  #
-  # These are required by:
-  #   - Electron apps (VS Code extensions, desktop apps)
-  #   - Chromium / Puppeteer / Playwright
-  #   - GUI apps via X11 / VNC / xvfb
-  #   - GTK / Qt applications
-  #   - Many npm/pip packages with native GUI deps
-  #
-  # Installed in the BASE image so every codespace clone
-  # inherits them without needing to re-install.
   # ============================================================== #
   echo -e "${CYAN}[*] Installing common dev & GUI/Electron libraries...${RESET}"
   proot-distro login ubuntu -- bash -c '
@@ -401,7 +510,7 @@ run_initial_setup() {
       mesa-utils \
       2>/dev/null || true
 
-    # --- Fonts (common web + system fonts) ---
+    # --- Fonts ---
     apt-get install -y --no-install-recommends \
       fonts-liberation \
       fonts-dejavu-core \
@@ -413,13 +522,8 @@ run_initial_setup() {
     apt-get install -y --no-install-recommends \
       libpulse0 \
       2>/dev/null || true
-
-    # --- Fix any dpkg breakage from the above ---
-    dpkg --configure --force-all -a 2>/dev/null || true
-
-    # Re-fix sudo SUID (some installs may reset it)
-    chmod u+s "$(command -v sudo)" 2>/dev/null || true
   '
+  post_apt_fix
 
   # ============================================================== #
   # STEP 5: Install code-server
@@ -430,8 +534,8 @@ run_initial_setup() {
     export DEBIAN_FRONTEND=noninteractive
     curl -fsSL https://code-server.dev/install.sh | sh
     mkdir -p /root/.config/code-server
-    dpkg --configure --force-all -a 2>/dev/null || true
   '
+  post_apt_fix
 
   # ============================================================== #
   # STEP 6: Configure code-server terminal profile
@@ -459,7 +563,7 @@ SETTINGS
   '
 
   # ============================================================== #
-  # STEP 7: Final verification + summary
+  # STEP 7: Final summary
   # ============================================================== #
   echo -e "${CYAN}[*] Reading the generated password (if any)...${RESET}"
   local pass=""
@@ -471,13 +575,13 @@ SETTINGS
   echo -e "${GREEN}${BOLD}Base setup complete.${RESET}"
   echo
   echo -e "${BOLD}Installed in base image:${RESET}"
-  echo -e "  ${GREEN}✓${RESET} Core tools     (git, curl, wget, python3, build-essential)"
-  echo -e "  ${GREEN}✓${RESET} Electron/GUI   (libnss3, libgbm1, libatk, libgtk-3, ...)"
-  echo -e "  ${GREEN}✓${RESET} X11/Display    (xvfb, xauth, dbus-x11, xdg-utils)"
-  echo -e "  ${GREEN}✓${RESET} Graphics       (libgl1, libvulkan1, mesa)"
-  echo -e "  ${GREEN}✓${RESET} Fonts          (liberation, dejavu, noto-emoji)"
-  echo -e "  ${GREEN}✓${RESET} code-server    (VS Code in browser)"
-  echo -e "  ${GREEN}✓${RESET} proot hardening (sudo shim, systemd stubs, machine-id)"
+  echo -e "  ${GREEN}✓${RESET} Core tools      (git, curl, wget, python3, build-essential)"
+  echo -e "  ${GREEN}✓${RESET} Electron/GUI    (libnss3, libgbm1, libatk, libgtk-3, ...)"
+  echo -e "  ${GREEN}✓${RESET} X11/Display     (xvfb, xauth, dbus-x11, xdg-utils)"
+  echo -e "  ${GREEN}✓${RESET} Graphics        (libgl1, libvulkan1, mesa)"
+  echo -e "  ${GREEN}✓${RESET} Fonts           (liberation, dejavu, noto-emoji)"
+  echo -e "  ${GREEN}✓${RESET} code-server     (VS Code in browser)"
+  echo -e "  ${GREEN}✓${RESET} proot hardening  (dpkg-divert, sudo shim, machine-id)"
   echo
   if [[ -n "$pass" ]]; then
     echo -e "Default code-server password: ${BOLD}${pass}${RESET}"
@@ -569,7 +673,7 @@ prepare_codespace_rootfs() {
 
   # Ensure machine-id exists in the clone
   if [[ ! -s "$rootfs/etc/machine-id" ]]; then
-    cat /proc/sys/kernel/random/uuid | tr -d '-' > "$rootfs/etc/machine-id"
+    echo "$(cat /proc/sys/kernel/random/uuid | tr -d '-')" > "$rootfs/etc/machine-id"
   fi
 
   # Ensure policy-rc.d exists in the clone
@@ -735,10 +839,6 @@ export LANG=C.UTF-8
 export MOZ_FAKE_NO_SANDBOX=1
 export PULSE_SERVER=127.0.0.1
 export PROOT_L2S_DIR="$rootfs/.l2s"
-
-# Uncomment for debugging:
-# export PROOT_VERBOSE=9
-# export PROOT_NO_SECCOMP=1
 
 # --- Launch proot with full path ---
 exec "$PROOT_BIN" \\
