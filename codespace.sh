@@ -181,108 +181,74 @@ find_free_port() {
 # ================================================================== #
 # harden_proot_ubuntu — fix sudo + systemd for proot environment
 #
-# Called via `proot-distro login ubuntu -- bash -c '...'` on the
-# BASE image during setup, and also applied to clones.
+# MUST run BEFORE any apt install that could pull systemd deps.
 #
 # Fixes:
-#   1. sudo "no new privileges" — restore SUID bit + add wrapper
-#      Ref: https://github.com/termux/proot-distro/issues/533
-#   2. systemd "Failed to seek /etc/machine-id" — pre-create
-#      machine-id, stub postinst scripts, policy-rc.d, apt hold
-#      Ref: https://github.com/sabamdarif/termux-desktop/issues/306
-#   3. debconf "No usable dialog-like program" — install dialog
+#   1. Pre-create /etc/machine-id (systemd lseek fails in proot)
+#   2. policy-rc.d exit 101 (no init system in proot)
+#   3. Stub systemd postinst scripts (no-op)
+#   4. dpkg --configure --force-all (fix broken state)
+#   5. apt-mark hold systemd packages
+#   6. chmod u+s sudo (bypass no_new_privs check)
+#   7. sudo wrapper shim (belt-and-suspenders)
+#   8. Mask systemd units
 # ================================================================== #
 harden_proot_ubuntu() {
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
 
-    # --------------------------------------------------------
-    # 1. PRE-CREATE /etc/machine-id BEFORE any apt operation
-    #    systemd-machine-id-setup calls lseek() on this file
-    #    which proot cannot emulate. If the file already exists
-    #    with a valid UUID, systemd skips the seek entirely.
-    # --------------------------------------------------------
+    # 1. PRE-CREATE /etc/machine-id
     if [[ ! -s /etc/machine-id ]]; then
       cat /proc/sys/kernel/random/uuid | tr -d "-" > /etc/machine-id
     fi
 
-    # --------------------------------------------------------
-    # 2. PREVENT SERVICES FROM STARTING (no init in proot)
-    #    policy-rc.d returning 101 tells dpkg to skip all
-    #    invoke-rc.d / service start calls.
-    # --------------------------------------------------------
-    cat > /usr/sbin/policy-rc.d << "POLICYEOF"
-#!/bin/sh
-exit 101
-POLICYEOF
+    # 2. PREVENT SERVICES FROM STARTING
+    printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
     chmod +x /usr/sbin/policy-rc.d
 
-    # --------------------------------------------------------
-    # 3. STUB OUT SYSTEMD POSTINST SCRIPTS
-    #    These scripts call systemd-machine-id-setup, systemctl,
-    #    etc. which all fail in proot. Replace with no-ops.
-    # --------------------------------------------------------
+    # 3. STUB SYSTEMD POSTINST SCRIPTS
     for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
                systemd-cryptsetup libsystemd-shared libpam-systemd \
                libnss-systemd dbus dbus-user-session; do
       script="/var/lib/dpkg/info/${pkg}.postinst"
       if [[ -f "$script" ]]; then
-        echo "#!/bin/sh" > "$script"
-        echo "exit 0"   >> "$script"
+        printf "#!/bin/sh\nexit 0\n" > "$script"
       fi
     done
 
-    # --------------------------------------------------------
-    # 4. FIX BROKEN DPKG STATE (if any)
-    # --------------------------------------------------------
+    # 4. FIX BROKEN DPKG STATE
     dpkg --configure --force-all -a 2>/dev/null || true
     apt --fix-broken install -y 2>/dev/null || true
 
-    # --------------------------------------------------------
-    # 5. HOLD SYSTEMD PACKAGES so apt never tries to
-    #    configure them again during future installs
-    # --------------------------------------------------------
+    # 5. HOLD SYSTEMD PACKAGES
     apt-mark hold systemd systemd-sysv systemd-timesyncd \
       systemd-resolved systemd-cryptsetup libsystemd-shared \
       libpam-systemd libnss-systemd 2>/dev/null || true
 
-    # --------------------------------------------------------
-    # 6. FIX SUDO for proot
-    #    Android sets no_new_privs on all processes.
-    #    sudo checks this flag ONLY when geteuid() != 0.
-    #    proot does not track file owners, so exec of a SUID
-    #    binary always sets euid to root. Restoring the SUID
-    #    bit makes sudo see euid=0 and skip the check.
-    #    Ref: https://github.com/termux/proot-distro/issues/533
-    # --------------------------------------------------------
+    # 6. FIX SUDO SUID BIT
     if command -v sudo >/dev/null 2>&1; then
       chmod u+s "$(command -v sudo)" 2>/dev/null || true
     fi
 
-    # Also create a wrapper as a belt-and-suspenders fallback.
-    # In proot with --change-id=0:0 we are ALWAYS root, so
-    # sudo just needs to exec the command directly.
+    # 7. SUDO WRAPPER SHIM
     mkdir -p /usr/local/bin
     cat > /usr/local/bin/sudo << "SUDOEOF"
 #!/bin/bash
-# proot sudo shim — we are already root via --change-id=0:0
-# Strip common sudo flags and exec the command directly.
+# proot sudo shim — already root via --change-id=0:0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -u|-g|-C|-p) shift 2 ;;   # options that take an argument
+    -u|-g|-C|-p) shift 2 ;;
     --)          shift; break ;;
-    -*)          shift ;;      # flags without arguments (-i, -s, -E, etc.)
-    *)           break ;;      # first non-option = the command
+    -*)          shift ;;
+    *)           break ;;
   esac
 done
 exec "$@"
 SUDOEOF
     chmod +x /usr/local/bin/sudo
 
-    # --------------------------------------------------------
-    # 7. MASK SYSTEMD UNITS that would fail if triggered
-    # --------------------------------------------------------
+    # 8. MASK SYSTEMD UNITS
     mkdir -p /etc/systemd/system
     for unit in systemd-resolved systemd-timesyncd systemd-networkd \
                 getty@tty1 remote-fs systemd-pstore; do
@@ -314,6 +280,9 @@ run_initial_setup() {
     exit 1
   fi
 
+  # ============================================================== #
+  # STEP 1: Install Ubuntu
+  # ============================================================== #
   echo -e "${CYAN}[*] Installing Ubuntu via proot-distro...${RESET}"
   proot-distro install ubuntu
 
@@ -335,46 +304,138 @@ run_initial_setup() {
   echo -e "${GREEN}[*] Ubuntu rootfs found at: $BASE_ROOTFS${RESET}"
   echo
 
-  # ----------------------------------------------------------
-  # CRITICAL: Harden the environment BEFORE any apt install.
-  # This pre-creates /etc/machine-id, stubs systemd postinst
-  # scripts, adds policy-rc.d, and fixes sudo.
-  # Without this, any apt install that pulls in systemd as a
-  # dependency will fail with "Failed to seek /etc/machine-id".
-  # ----------------------------------------------------------
+  # ============================================================== #
+  # STEP 2: Harden proot environment (BEFORE any apt install)
+  # ============================================================== #
   echo -e "${CYAN}[*] Hardening proot environment (sudo, systemd, machine-id)...${RESET}"
   harden_proot_ubuntu
 
+  # ============================================================== #
+  # STEP 3: Base tooling
+  # ============================================================== #
   echo -e "${CYAN}[*] Updating packages and installing base tooling...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt update
-    apt install -y dialog sudo curl wget git python3 python3-pip \
-      ca-certificates bash lsb-release
+    apt install -y \
+      dialog sudo curl wget git \
+      python3 python3-pip python3-venv \
+      ca-certificates bash lsb-release \
+      unzip zip tar xz-utils \
+      jq tree htop nano vim less \
+      openssh-client rsync net-tools dnsutils \
+      build-essential pkg-config
     apt upgrade -y
-    # Ensure bash is the default shell for root
     chsh -s /bin/bash root 2>/dev/null || true
-    # Re-fix sudo SUID bit (apt upgrade may have reset it)
     chmod u+s "$(command -v sudo)" 2>/dev/null || true
-    # Fix any dpkg breakage from the upgrade
     dpkg --configure --force-all -a 2>/dev/null || true
   '
 
+  # ============================================================== #
+  # STEP 4: Common dev & GUI / Electron / Chromium libraries
+  #
+  # These are required by:
+  #   - Electron apps (VS Code extensions, desktop apps)
+  #   - Chromium / Puppeteer / Playwright
+  #   - GUI apps via X11 / VNC / xvfb
+  #   - GTK / Qt applications
+  #   - Many npm/pip packages with native GUI deps
+  #
+  # Installed in the BASE image so every codespace clone
+  # inherits them without needing to re-install.
+  # ============================================================== #
+  echo -e "${CYAN}[*] Installing common dev & GUI/Electron libraries...${RESET}"
+  proot-distro login ubuntu -- bash -c '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- Electron / Chromium runtime dependencies ---
+    apt-get install -y --no-install-recommends \
+      libatk1.0-0 \
+      libatk-bridge2.0-0 \
+      libcups2 \
+      libdrm2 \
+      libxkbcommon0 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxfixes3 \
+      libxrandr2 \
+      libgbm1 \
+      libasound2t64 \
+      libpango-1.0-0 \
+      libcairo2 \
+      libnss3 \
+      libxshmfence1 \
+      libnspr4 \
+      libx11-xcb1 \
+      libxcb-dri3-0 \
+      libxss1 \
+      libxtst6 \
+      2>/dev/null || true
+
+    # --- GTK / GUI toolkit ---
+    apt-get install -y --no-install-recommends \
+      libgtk-3-0 \
+      libgdk-pixbuf-2.0-0 \
+      libnotify4 \
+      libsecret-1-0 \
+      libxslt1.1 \
+      2>/dev/null || true
+
+    # --- X11 / display / virtual framebuffer ---
+    apt-get install -y --no-install-recommends \
+      xvfb \
+      xauth \
+      x11-utils \
+      x11-xserver-utils \
+      dbus-x11 \
+      xdg-utils \
+      2>/dev/null || true
+
+    # --- Graphics / rendering ---
+    apt-get install -y --no-install-recommends \
+      libgl1 \
+      libglu1-mesa \
+      libvulkan1 \
+      mesa-utils \
+      2>/dev/null || true
+
+    # --- Fonts (common web + system fonts) ---
+    apt-get install -y --no-install-recommends \
+      fonts-liberation \
+      fonts-dejavu-core \
+      fonts-noto-color-emoji \
+      fontconfig \
+      2>/dev/null || true
+
+    # --- Multimedia / audio ---
+    apt-get install -y --no-install-recommends \
+      libpulse0 \
+      2>/dev/null || true
+
+    # --- Fix any dpkg breakage from the above ---
+    dpkg --configure --force-all -a 2>/dev/null || true
+
+    # Re-fix sudo SUID (some installs may reset it)
+    chmod u+s "$(command -v sudo)" 2>/dev/null || true
+  '
+
+  # ============================================================== #
+  # STEP 5: Install code-server
+  # ============================================================== #
   echo -e "${CYAN}[*] Installing code-server...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
     curl -fsSL https://code-server.dev/install.sh | sh
     mkdir -p /root/.config/code-server
-    # Fix dpkg state after code-server install (it may pull deps)
     dpkg --configure --force-all -a 2>/dev/null || true
   '
 
-  # ----------------------------------------------------------
-  # Write code-server settings.json with explicit terminal
-  # profile so VS Code knows exactly which shell to use.
-  # ----------------------------------------------------------
+  # ============================================================== #
+  # STEP 6: Configure code-server terminal profile
+  # ============================================================== #
   echo -e "${CYAN}[*] Configuring code-server terminal profile...${RESET}"
   proot-distro login ubuntu -- bash -c '
     mkdir -p /root/.local/share/code-server/User
@@ -397,6 +458,9 @@ run_initial_setup() {
 SETTINGS
   '
 
+  # ============================================================== #
+  # STEP 7: Final verification + summary
+  # ============================================================== #
   echo -e "${CYAN}[*] Reading the generated password (if any)...${RESET}"
   local pass=""
   pass=$(proot-distro login ubuntu -- bash -c \
@@ -405,6 +469,16 @@ SETTINGS
 
   echo
   echo -e "${GREEN}${BOLD}Base setup complete.${RESET}"
+  echo
+  echo -e "${BOLD}Installed in base image:${RESET}"
+  echo -e "  ${GREEN}✓${RESET} Core tools     (git, curl, wget, python3, build-essential)"
+  echo -e "  ${GREEN}✓${RESET} Electron/GUI   (libnss3, libgbm1, libatk, libgtk-3, ...)"
+  echo -e "  ${GREEN}✓${RESET} X11/Display    (xvfb, xauth, dbus-x11, xdg-utils)"
+  echo -e "  ${GREEN}✓${RESET} Graphics       (libgl1, libvulkan1, mesa)"
+  echo -e "  ${GREEN}✓${RESET} Fonts          (liberation, dejavu, noto-emoji)"
+  echo -e "  ${GREEN}✓${RESET} code-server    (VS Code in browser)"
+  echo -e "  ${GREEN}✓${RESET} proot hardening (sudo shim, systemd stubs, machine-id)"
+  echo
   if [[ -n "$pass" ]]; then
     echo -e "Default code-server password: ${BOLD}${pass}${RESET}"
     echo -e "${RED}Store this somewhere safe — it will not be shown again.${RESET}"
@@ -482,7 +556,7 @@ fix_l2s_symlinks() {
 }
 
 # ================================================================== #
-# prepare_codespace_rootfs — create required directories
+# prepare_codespace_rootfs — create required directories + safety
 # ================================================================== #
 prepare_codespace_rootfs() {
   local rootfs="$1"
@@ -493,8 +567,7 @@ prepare_codespace_rootfs() {
   mkdir -p "$rootfs/dev/shm"
   mkdir -p "$rootfs/run"
 
-  # Ensure machine-id exists in the clone (in case base was set up
-  # before v4.3, or the clone somehow lost it)
+  # Ensure machine-id exists in the clone
   if [[ ! -s "$rootfs/etc/machine-id" ]]; then
     cat /proc/sys/kernel/random/uuid | tr -d '-' > "$rootfs/etc/machine-id"
   fi
@@ -515,7 +588,7 @@ prepare_codespace_rootfs() {
     mkdir -p "$rootfs/usr/local/bin"
     cat > "$rootfs/usr/local/bin/sudo" << 'SUDOEOF'
 #!/bin/bash
-# proot sudo shim — we are already root via --change-id=0:0
+# proot sudo shim — already root via --change-id=0:0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -u|-g|-C|-p) shift 2 ;;
