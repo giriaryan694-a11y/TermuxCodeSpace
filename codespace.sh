@@ -53,6 +53,34 @@ RESET='\033[0m'
 mkdir -p "$CODESPACES_DIR" "$META_DIR"
 mkdir -p "$PREFIX/tmp"
 
+# ================================================================== #
+# PROOT_BIND_EXCLUDES — directories that proot creates inside the
+# rootfs as bind-mount targets with 000 permissions.
+#
+# These are Android system paths, NOT part of the Ubuntu filesystem.
+# proot materialises them at runtime via --bind flags; they must be
+# excluded from export archives.
+#
+# Ref: https://github.com/termux/proot-distro/issues/683
+# Ref: proot-distro backup _fix_permissions() in commands/backup.py
+# ================================================================== #
+PROOT_BIND_EXCLUDES=(
+  ".l2s"           # proot link2symlink backing store (recreated at runtime)
+  "data"           # Android /data — com.termux bind mounts
+  "dev"            # device files (proot binds host /dev at runtime)
+  "proc"           # /proc (proot binds host /proc at runtime)
+  "sys"            # /sys (proot binds host /sys at runtime)
+  "storage"        # Android storage
+  "sdcard"         # Android sdcard symlink
+  "system"         # Android system partition
+  "system_ext"     # Android system_ext partition
+  "apex"           # Android APEX modules
+  "vendor"         # Android vendor partition
+  "product"        # Android product partition
+  "odm"            # Android ODM partition
+  "linkerconfig"   # Android linker configuration
+)
+
 # ------------------------------------------------------------------ #
 # UI helpers
 # ------------------------------------------------------------------ #
@@ -182,48 +210,22 @@ find_free_port() {
 
 # ================================================================== #
 # harden_proot_ubuntu — make Ubuntu safe for proot
-#
-# Uses dpkg-divert to permanently redirect systemd binaries.
-# Unlike postinst stubbing (which dpkg overwrites on unpack),
-# diversions are stored in dpkg's database and respected for
-# ALL future installs AND upgrades.
-#
-# Ref: https://man7.org/linux/man-pages/man1/dpkg-divert.1.html
-# Ref: https://github.com/sabamdarif/termux-desktop/issues/306
 # ================================================================== #
 harden_proot_ubuntu() {
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
 
-    # ============================================================
-    # 1. PRE-CREATE /etc/machine-id with valid UUID + newline
-    # ============================================================
     if [[ ! -s /etc/machine-id ]]; then
       echo "$(cat /proc/sys/kernel/random/uuid | tr -d "-")" > /etc/machine-id
     fi
 
-    # ============================================================
-    # 2. PREVENT SERVICES FROM STARTING (no init in proot)
-    # ============================================================
     printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
     chmod +x /usr/sbin/policy-rc.d
 
-    # ============================================================
-    # 3. dpkg-divert SYSTEMD BINARIES
-    #
-    # This is the KEY fix. dpkg-divert registers a permanent
-    # redirect in dpkg database. When ANY package (new install
-    # or upgrade) tries to install these files, dpkg puts the
-    # real binary at the .real path and leaves our fake in place.
-    #
-    # Unlike stubbing postinst scripts (which dpkg overwrites
-    # during unpack), diversions survive everything.
-    # ============================================================
     divert_binary() {
       local binpath="$1"
       local divert="${binpath}.real"
-      # Register diversion (--rename moves existing file if present)
       if [[ -f "$binpath" && ! -L "$binpath" ]]; then
         dpkg-divert --add --rename --divert "$divert" "$binpath" 2>/dev/null || true
       else
@@ -231,7 +233,6 @@ harden_proot_ubuntu() {
       fi
     }
 
-    # The binaries that systemd postinst calls and that fail in proot:
     divert_binary /usr/bin/systemd-machine-id-setup
     divert_binary /bin/systemctl
     divert_binary /usr/bin/systemctl
@@ -242,7 +243,6 @@ harden_proot_ubuntu() {
     divert_binary /usr/bin/systemd-firstboot
     divert_binary /usr/lib/systemd/systemd-network-generator
 
-    # Create fake no-op scripts at the original paths
     for binpath in \
       /usr/bin/systemd-machine-id-setup \
       /bin/systemctl \
@@ -256,20 +256,13 @@ harden_proot_ubuntu() {
       mkdir -p "$(dirname "$binpath")"
       cat > "$binpath" << "FAKEBIN"
 #!/bin/sh
-# proot shim — systemd binaries do not work under proot.
-# This no-op replacement prevents postinst failures.
-# Ref: https://github.com/sabamdarif/termux-desktop/issues/306
 exit 0
 FAKEBIN
       chmod +x "$binpath"
     done
 
-    # Special case: systemd-machine-id-setup should ensure machine-id exists
     cat > /usr/bin/systemd-machine-id-setup << "MIDEOF"
 #!/bin/sh
-# proot shim for systemd-machine-id-setup
-# Ensures /etc/machine-id exists with a valid UUID, then exits.
-# The real binary calls lseek() which proot cannot emulate.
 if [ ! -s /etc/machine-id ]; then
   echo "$(cat /proc/sys/kernel/random/uuid | tr -d "-")" > /etc/machine-id
 fi
@@ -277,11 +270,6 @@ exit 0
 MIDEOF
     chmod +x /usr/bin/systemd-machine-id-setup
 
-    # ============================================================
-    # 4. STUB POSTINST SCRIPTS (belt-and-suspenders)
-    #    These WILL be overwritten by dpkg unpack, but the
-    #    diverted binaries above prevent the actual failure.
-    # ============================================================
     for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
                systemd-cryptsetup libsystemd-shared libpam-systemd \
                libnss-systemd dbus dbus-user-session; do
@@ -291,22 +279,13 @@ MIDEOF
       fi
     done
 
-    # ============================================================
-    # 5. FIX BROKEN DPKG STATE (if any from previous attempts)
-    # ============================================================
     dpkg --configure --force-all -a 2>/dev/null || true
     apt --fix-broken install -y 2>/dev/null || true
 
-    # ============================================================
-    # 6. HOLD SYSTEMD PACKAGES (prevent future upgrades)
-    # ============================================================
     apt-mark hold systemd systemd-sysv systemd-timesyncd \
       systemd-resolved systemd-cryptsetup libsystemd-shared \
       libpam-systemd libnss-systemd 2>/dev/null || true
 
-    # ============================================================
-    # 7. FIX SUDO for proot
-    # ============================================================
     if command -v sudo >/dev/null 2>&1; then
       chmod u+s "$(command -v sudo)" 2>/dev/null || true
     fi
@@ -314,7 +293,6 @@ MIDEOF
     mkdir -p /usr/local/bin
     cat > /usr/local/bin/sudo << "SUDOEOF"
 #!/bin/bash
-# proot sudo shim — already root via --change-id=0:0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -u|-g|-C|-p) shift 2 ;;
@@ -327,9 +305,6 @@ exec "$@"
 SUDOEOF
     chmod +x /usr/local/bin/sudo
 
-    # ============================================================
-    # 8. MASK SYSTEMD UNITS
-    # ============================================================
     mkdir -p /etc/systemd/system
     for unit in systemd-resolved systemd-timesyncd systemd-networkd \
                 getty@tty1 remote-fs systemd-pstore; do
@@ -340,17 +315,11 @@ SUDOEOF
 
 # ================================================================== #
 # post_apt_fix — safety net after EVERY apt operation
-#
-# dpkg unpack replaces postinst scripts with the real ones from
-# the .deb. This function re-stubs them and re-fixes sudo.
-# The dpkg-diverted binaries (from harden_proot_ubuntu) are the
-# real protection; this is just belt-and-suspenders.
 # ================================================================== #
 post_apt_fix() {
   proot-distro login ubuntu -- bash -c '
     export DEBIAN_FRONTEND=noninteractive
 
-    # Re-stub postinst scripts (dpkg unpack may have replaced them)
     for pkg in systemd systemd-sysv systemd-timesyncd systemd-resolved \
                systemd-cryptsetup libsystemd-shared libpam-systemd \
                libnss-systemd dbus dbus-user-session; do
@@ -360,15 +329,12 @@ post_apt_fix() {
       fi
     done
 
-    # Fix any broken dpkg state
     dpkg --configure --force-all -a 2>/dev/null || true
 
-    # Re-fix sudo SUID bit (apt may have reset it)
     if command -v sudo >/dev/null 2>&1; then
       chmod u+s "$(command -v sudo)" 2>/dev/null || true
     fi
 
-    # Re-hold systemd packages
     apt-mark hold systemd systemd-sysv systemd-timesyncd \
       systemd-resolved systemd-cryptsetup libsystemd-shared \
       libpam-systemd libnss-systemd 2>/dev/null || true
@@ -398,9 +364,6 @@ run_initial_setup() {
     exit 1
   fi
 
-  # ============================================================== #
-  # STEP 1: Install Ubuntu
-  # ============================================================== #
   echo -e "${CYAN}[*] Installing Ubuntu via proot-distro...${RESET}"
   proot-distro install ubuntu
 
@@ -422,19 +385,9 @@ run_initial_setup() {
   echo -e "${GREEN}[*] Ubuntu rootfs found at: $BASE_ROOTFS${RESET}"
   echo
 
-  # ============================================================== #
-  # STEP 2: Harden proot environment (BEFORE any apt install)
-  #
-  # dpkg-divert systemd binaries so that when ANY future apt
-  # operation installs/upgrades systemd, the real binaries go
-  # to .real paths and our no-op fakes stay in place.
-  # ============================================================== #
   echo -e "${CYAN}[*] Hardening proot environment (dpkg-divert, sudo, machine-id)...${RESET}"
   harden_proot_ubuntu
 
-  # ============================================================== #
-  # STEP 3: Base tooling
-  # ============================================================== #
   echo -e "${CYAN}[*] Updating packages and installing base tooling...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
@@ -453,83 +406,44 @@ run_initial_setup() {
   '
   post_apt_fix
 
-  # ============================================================== #
-  # STEP 4: Common dev & GUI / Electron / Chromium libraries
-  # ============================================================== #
   echo -e "${CYAN}[*] Installing common dev & GUI/Electron libraries...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
 
-    # --- Electron / Chromium runtime dependencies ---
     apt-get install -y --no-install-recommends \
-      libatk1.0-0 \
-      libatk-bridge2.0-0 \
-      libcups2 \
-      libdrm2 \
-      libxkbcommon0 \
-      libxcomposite1 \
-      libxdamage1 \
-      libxfixes3 \
-      libxrandr2 \
-      libgbm1 \
-      libasound2t64 \
-      libpango-1.0-0 \
-      libcairo2 \
-      libnss3 \
-      libxshmfence1 \
-      libnspr4 \
-      libx11-xcb1 \
-      libxcb-dri3-0 \
-      libxss1 \
-      libxtst6 \
+      libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+      libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+      libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
+      libcairo2 libnss3 libxshmfence1 libnspr4 \
+      libx11-xcb1 libxcb-dri3-0 libxss1 libxtst6 \
       2>/dev/null || true
 
-    # --- GTK / GUI toolkit ---
     apt-get install -y --no-install-recommends \
-      libgtk-3-0 \
-      libgdk-pixbuf-2.0-0 \
-      libnotify4 \
-      libsecret-1-0 \
-      libxslt1.1 \
+      libgtk-3-0 libgdk-pixbuf-2.0-0 libnotify4 \
+      libsecret-1-0 libxslt1.1 \
       2>/dev/null || true
 
-    # --- X11 / display / virtual framebuffer ---
     apt-get install -y --no-install-recommends \
-      xvfb \
-      xauth \
-      x11-utils \
-      x11-xserver-utils \
-      dbus-x11 \
-      xdg-utils \
+      xvfb xauth x11-utils x11-xserver-utils \
+      dbus-x11 xdg-utils \
       2>/dev/null || true
 
-    # --- Graphics / rendering ---
     apt-get install -y --no-install-recommends \
-      libgl1 \
-      libglu1-mesa \
-      libvulkan1 \
-      mesa-utils \
+      libgl1 libglu1-mesa libvulkan1 mesa-utils \
       2>/dev/null || true
 
-    # --- Fonts ---
     apt-get install -y --no-install-recommends \
-      fonts-liberation \
-      fonts-dejavu-core \
-      fonts-noto-color-emoji \
-      fontconfig \
+      fonts-liberation fonts-dejavu-core \
+      fonts-noto-color-emoji fontconfig \
       2>/dev/null || true
 
-    # --- Multimedia / audio ---
     apt-get install -y --no-install-recommends \
       libpulse0 \
       2>/dev/null || true
   '
   post_apt_fix
 
-  # ============================================================== #
-  # STEP 5: Install code-server
-  # ============================================================== #
   echo -e "${CYAN}[*] Installing code-server...${RESET}"
   proot-distro login ubuntu -- bash -c '
     set -e
@@ -539,9 +453,6 @@ run_initial_setup() {
   '
   post_apt_fix
 
-  # ============================================================== #
-  # STEP 6: Configure code-server terminal profile
-  # ============================================================== #
   echo -e "${CYAN}[*] Configuring code-server terminal profile...${RESET}"
   proot-distro login ubuntu -- bash -c '
     mkdir -p /root/.local/share/code-server/User
@@ -549,24 +460,14 @@ run_initial_setup() {
 {
   "terminal.integrated.defaultProfile.linux": "bash",
   "terminal.integrated.profiles.linux": {
-    "bash": {
-      "path": "/bin/bash",
-      "args": ["-l"]
-    },
-    "sh": {
-      "path": "/bin/sh"
-    }
+    "bash": { "path": "/bin/bash", "args": ["-l"] },
+    "sh":   { "path": "/bin/sh" }
   },
-  "terminal.integrated.env.linux": {
-    "SHELL": "/bin/bash"
-  }
+  "terminal.integrated.env.linux": { "SHELL": "/bin/bash" }
 }
 SETTINGS
   '
 
-  # ============================================================== #
-  # STEP 7: Final summary
-  # ============================================================== #
   echo -e "${CYAN}[*] Reading the generated password (if any)...${RESET}"
   local pass=""
   pass=$(proot-distro login ubuntu -- bash -c \
@@ -662,6 +563,23 @@ fix_l2s_symlinks() {
 }
 
 # ================================================================== #
+# fix_rootfs_permissions — make chmod-000 subtrees readable
+#
+# proot creates bind-mount target directories with 000 permissions.
+# This mirrors proot-distro backup's _fix_permissions() so tar can
+# traverse the entire rootfs without "Permission denied" errors.
+#
+# Ref: https://github.com/termux/proot-distro/issues/683
+# Ref: proot-distro commands/backup.py _fix_permissions()
+# ================================================================== #
+fix_rootfs_permissions() {
+  local rootfs="$1"
+  echo -e "${CYAN}[*] Fixing file permissions in rootfs (chmod-000 subtrees)...${RESET}"
+  find "$rootfs" -type d ! -readable -exec chmod u+rx {} + 2>/dev/null || true
+  find "$rootfs" -type f ! -readable -exec chmod u+r {} + 2>/dev/null || true
+}
+
+# ================================================================== #
 # prepare_codespace_rootfs — create required directories + safety
 # ================================================================== #
 prepare_codespace_rootfs() {
@@ -673,28 +591,29 @@ prepare_codespace_rootfs() {
   mkdir -p "$rootfs/dev/shm"
   mkdir -p "$rootfs/run"
 
-  # Ensure machine-id exists in the clone
+  # Recreate directories that proot expects as bind-mount targets.
+  # These are excluded from export archives (Android artifacts)
+  # but proot needs them to exist for --bind to work.
+  mkdir -p "$rootfs/proc"
+  mkdir -p "$rootfs/sys"
+
   if [[ ! -s "$rootfs/etc/machine-id" ]]; then
     echo "$(cat /proc/sys/kernel/random/uuid | tr -d '-')" > "$rootfs/etc/machine-id"
   fi
 
-  # Ensure policy-rc.d exists in the clone
   if [[ ! -f "$rootfs/usr/sbin/policy-rc.d" ]]; then
     printf '#!/bin/sh\nexit 101\n' > "$rootfs/usr/sbin/policy-rc.d"
     chmod +x "$rootfs/usr/sbin/policy-rc.d"
   fi
 
-  # Ensure sudo SUID bit is set in the clone
   if [[ -f "$rootfs/usr/bin/sudo" ]]; then
     chmod u+s "$rootfs/usr/bin/sudo" 2>/dev/null || true
   fi
 
-  # Ensure sudo wrapper exists in the clone
   if [[ ! -f "$rootfs/usr/local/bin/sudo" ]]; then
     mkdir -p "$rootfs/usr/local/bin"
     cat > "$rootfs/usr/local/bin/sudo" << 'SUDOEOF'
 #!/bin/bash
-# proot sudo shim — already root via --change-id=0:0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -u|-g|-C|-p) shift 2 ;;
@@ -720,23 +639,58 @@ write_codeserver_settings() {
 {
   "terminal.integrated.defaultProfile.linux": "bash",
   "terminal.integrated.profiles.linux": {
-    "bash": {
-      "path": "/bin/bash",
-      "args": ["-l"]
-    },
-    "sh": {
-      "path": "/bin/sh"
-    }
+    "bash": { "path": "/bin/bash", "args": ["-l"] },
+    "sh":   { "path": "/bin/sh" }
   },
-  "terminal.integrated.env.linux": {
-    "SHELL": "/bin/bash"
-  }
+  "terminal.integrated.env.linux": { "SHELL": "/bin/bash" }
 }
 SETTINGS
 }
 
 # ================================================================== #
-# export_codespace — pack a codespace's rootfs into a .zip archive
+# prompt_core_count
+# ================================================================== #
+prompt_core_count() {
+  local total
+  total=$(nproc --all 2>/dev/null)
+  [[ -z "$total" || ! "$total" =~ ^[0-9]+$ || "$total" -lt 1 ]] && total=1
+
+  local chosen
+  read -rp "CPU cores to use for pigz [detected: $total, Enter = all $total]: " chosen >&2
+  chosen="${chosen:-$total}"
+
+  if ! [[ "$chosen" =~ ^[0-9]+$ ]] || [[ "$chosen" -lt 1 ]]; then
+    echo -e "${YELLOW}Invalid input, using all $total core(s).${RESET}" >&2
+    chosen="$total"
+  elif [[ "$chosen" -gt "$total" ]]; then
+    echo -e "${YELLOW}Only $total core(s) detected, capping to $total.${RESET}" >&2
+    chosen="$total"
+  fi
+
+  echo "$chosen"
+}
+
+# ================================================================== #
+# require_pigz
+# ================================================================== #
+require_pigz() {
+  if command -v pigz >/dev/null 2>&1; then
+    return 0
+  fi
+  echo -e "${RED}'pigz' is not installed.${RESET}"
+  echo "Install it with:  pkg install pigz -y"
+  return 1
+}
+
+# ================================================================== #
+# export_codespace — FIXED
+#
+# FIX 1: fix_rootfs_permissions() before tar (chmod-000 → u+rx)
+# FIX 2: --exclude for all proot bind-mount artifact paths
+# FIX 3: --ignore-failed-read --warning=no-failed-read safety net
+# FIX 4: tar exit code 1 = warnings (OK); only >= 2 = real failure
+#
+# Ref: https://github.com/termux/proot-distro/issues/683
 # ================================================================== #
 export_codespace() {
   local name="$1"
@@ -749,11 +703,7 @@ export_codespace() {
     press_any_key; return
   fi
 
-  if ! command -v zip >/dev/null 2>&1; then
-    echo -e "${RED}'zip' is not installed.${RESET}"
-    echo "Install it with:  pkg install zip -y   (or, inside Ubuntu: apt install zip -y)"
-    press_any_key; return
-  fi
+  require_pigz || { press_any_key; return; }
 
   if is_running "$name"; then
     echo -e "${YELLOW}'$name' is currently running. For a clean, consistent export it's${RESET}"
@@ -765,17 +715,17 @@ export_codespace() {
     echo
   fi
 
-  read -rp "Export path (directory or full .zip file path) [default: $HOME/${name}.zip]: " export_path
-  export_path="${export_path:-$HOME/${name}.zip}"
+  read -rp "Export path (directory or full .tar.gz file path) [default: $HOME/${name}.tar.gz]: " export_path
+  export_path="${export_path:-$HOME/${name}.tar.gz}"
   export_path="${export_path/#\~/$HOME}"
 
-  # If the user gave an existing directory, drop the archive inside it
   if [[ -d "$export_path" ]]; then
-    export_path="${export_path%/}/${name}.zip"
+    export_path="${export_path%/}/${name}.tar.gz"
   fi
 
-  # Make sure it ends in .zip
-  [[ "$export_path" == *.zip ]] || export_path="${export_path}.zip"
+  if [[ "$export_path" != *.tar.gz && "$export_path" != *.tgz ]]; then
+    export_path="${export_path}.tar.gz"
+  fi
 
   local export_dir
   export_dir="$(dirname "$export_path")"
@@ -790,7 +740,20 @@ export_codespace() {
     rm -f "$export_path"
   fi
 
-  # Stash a small metadata file (name/port/password) so import can restore them
+  local cores
+  cores=$(prompt_core_count)
+
+  # ---- FIX 1: Fix chmod-000 permissions ----
+  fix_rootfs_permissions "$CODESPACES_DIR/$name"
+
+  # ---- FIX 2: Build --exclude flags ----
+  local tar_excludes=()
+  local p
+  for p in "${PROOT_BIND_EXCLUDES[@]}"; do
+    tar_excludes+=("--exclude=${name}/${p}")
+  done
+
+  # ---- Metadata: write into temp dir, append via second -C ----
   local tmp_meta_dir
   tmp_meta_dir=$(mktemp -d)
   {
@@ -799,64 +762,77 @@ export_codespace() {
     echo "pass=$(cat "$META_DIR/$name.pass" 2>/dev/null)"
   } > "$tmp_meta_dir/codespace.meta"
 
-  echo -e "${CYAN}[*] Zipping codespace '$name' — this can take a while for large images...${RESET}"
+  echo -e "${CYAN}[*] Compressing codespace '$name' with pigz (${cores} core(s)) — this can take a while for large images...${RESET}"
 
-  (
-    cd "$CODESPACES_DIR" || exit 1
-    zip -r -y -q "$export_path" "$name"
-  )
-  local zip_status=$?
+  # ---- FIX 3 & 4: tar with excludes + ignore-failed-read ----
+  tar --ignore-failed-read --warning=no-failed-read \
+      "${tar_excludes[@]}" \
+      -cf - -C "$CODESPACES_DIR" "$name" \
+      -C "$tmp_meta_dir" "codespace.meta" \
+    | pigz -p "$cores" > "$export_path"
+  local pipe_status=("${PIPESTATUS[@]}")
+  rm -rf "$tmp_meta_dir"
 
-  if [[ $zip_status -ne 0 || ! -f "$export_path" ]]; then
-    echo -e "${RED}Export failed.${RESET}"
-    rm -rf "$tmp_meta_dir"
+  # tar exit 1 = "some files differ" (acceptable); >= 2 = real failure
+  if [[ "${pipe_status[0]}" -ge 2 || "${pipe_status[1]}" -ne 0 || ! -s "$export_path" ]]; then
+    echo -e "${RED}Export failed (tar=${pipe_status[0]}, pigz=${pipe_status[1]}).${RESET}"
+    rm -f "$export_path"
     press_any_key; return
   fi
 
-  # Append the metadata file to the archive (stored at the zip root)
-  zip -q -j "$export_path" "$tmp_meta_dir/codespace.meta"
-  rm -rf "$tmp_meta_dir"
+  if [[ "${pipe_status[0]}" -eq 1 ]]; then
+    echo -e "${YELLOW}[!] tar reported minor warnings (files changed during read). Archive is still valid.${RESET}"
+  fi
 
   local size
   size=$(du -h "$export_path" 2>/dev/null | cut -f1)
 
   echo
   echo -e "${GREEN}${BOLD}Export complete.${RESET}"
-  echo -e "  File: $export_path"
-  [[ -n "$size" ]] && echo -e "  Size: $size"
+  echo -e "  File:  $export_path"
+  [[ -n "$size" ]] && echo -e "  Size:  $size"
+  echo -e "  Cores: $cores"
   press_any_key
 }
 
 # ================================================================== #
-# import_codespace — restore a codespace from a .zip archive
+# import_codespace — FIXED
+#
+# After extraction, prepare_codespace_rootfs() recreates all the
+# directories that were excluded from the archive (dev, proc, sys,
+# .l2s, etc.) so proot's --bind flags work correctly.
 # ================================================================== #
 import_codespace() {
   clear; banner
   echo -e "${BOLD}Import Codespace${RESET}"
   echo
 
-  if ! command -v unzip >/dev/null 2>&1; then
-    echo -e "${RED}'unzip' is not installed.${RESET}"
-    echo "Install it with:  pkg install unzip -y   (or, inside Ubuntu: apt install unzip -y)"
+  require_pigz || { press_any_key; return; }
+
+  if ! command -v tar >/dev/null 2>&1; then
+    echo -e "${RED}'tar' is not installed.${RESET}"
+    echo "Install it with:  pkg install tar -y"
     press_any_key; return
   fi
 
-  read -rp "Path to codespace .zip file: " zip_path
-  zip_path="${zip_path/#\~/$HOME}"
+  read -rp "Path to codespace archive (.tar.gz / .tgz): " archive_path
+  archive_path="${archive_path/#\~/$HOME}"
 
-  if [[ ! -f "$zip_path" ]]; then
-    echo -e "${RED}File not found: $zip_path${RESET}"
+  if [[ ! -f "$archive_path" ]]; then
+    echo -e "${RED}File not found: $archive_path${RESET}"
     press_any_key; return
   fi
 
-  if ! unzip -l "$zip_path" >/dev/null 2>&1; then
-    echo -e "${RED}'$zip_path' does not look like a valid .zip file.${RESET}"
+  if ! pigz -t "$archive_path" >/dev/null 2>&1; then
+    echo -e "${RED}'$archive_path' does not look like a valid pigz/gzip archive.${RESET}"
     press_any_key; return
   fi
 
-  # Best-effort read of the metadata file written by export_codespace
+  local cores
+  cores=$(prompt_core_count)
+
   local meta name_in_zip port_in_zip pass_in_zip
-  meta=$(unzip -p "$zip_path" codespace.meta 2>/dev/null) || true
+  meta=$(pigz -dc -p "$cores" "$archive_path" | tar -xO -f - codespace.meta 2>/dev/null) || true
   name_in_zip=$(echo "$meta" | grep '^name=' | cut -d= -f2-)
   port_in_zip=$(echo "$meta" | grep '^port=' | cut -d= -f2-)
   pass_in_zip=$(echo "$meta" | grep '^pass=' | cut -d= -f2-)
@@ -876,18 +852,16 @@ import_codespace() {
     press_any_key; return
   fi
 
-  echo -e "${CYAN}[*] Extracting archive — this can take a while for large images...${RESET}"
+  echo -e "${CYAN}[*] Decompressing archive with pigz (${cores} core(s)) — this can take a while for large images...${RESET}"
   local tmp_extract
   tmp_extract=$(mktemp -d)
 
-  if ! unzip -q "$zip_path" -d "$tmp_extract"; then
+  if ! pigz -dc -p "$cores" "$archive_path" | tar -xf - -C "$tmp_extract" 2>/dev/null; then
     echo -e "${RED}Extraction failed.${RESET}"
     rm -rf "$tmp_extract"
     press_any_key; return
   fi
 
-  # The zip was created from inside CODESPACES_DIR, so the rootfs should be
-  # the single top-level directory (name matches the exported codespace name).
   local extracted_dir
   if [[ -n "$name_in_zip" && -d "$tmp_extract/$name_in_zip" ]]; then
     extracted_dir="$tmp_extract/$name_in_zip"
@@ -896,7 +870,7 @@ import_codespace() {
   fi
 
   if [[ -z "$extracted_dir" || ! -d "$extracted_dir" ]]; then
-    echo -e "${RED}Could not find a codespace rootfs inside the zip.${RESET}"
+    echo -e "${RED}Could not find a codespace rootfs inside the archive.${RESET}"
     rm -rf "$tmp_extract"
     press_any_key; return
   fi
@@ -907,6 +881,8 @@ import_codespace() {
   if [[ -n "$name_in_zip" && "$name_in_zip" != "$new_name" ]]; then
     fix_l2s_symlinks "$CODESPACES_DIR/$name_in_zip" "$CODESPACES_DIR/$new_name"
   fi
+
+  # Recreate all directories excluded from the archive
   prepare_codespace_rootfs "$CODESPACES_DIR/$new_name"
   write_codeserver_settings "$CODESPACES_DIR/$new_name"
 
@@ -1008,7 +984,7 @@ CFG
 }
 
 # ================================================================== #
-# start_codespace — launch code-server inside a cloned rootfs
+# start_codespace
 # ================================================================== #
 start_codespace() {
   local name="$1"
@@ -1033,16 +1009,10 @@ start_codespace() {
     local launcher="$META_DIR/$name.launcher.sh"
     cat > "$launcher" <<LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
-# Auto-generated launcher for codespace '$name' — do not edit
 set -uo pipefail
-
-# CRITICAL: disable termux-exec
 unset LD_PRELOAD
-
-# Ensure proot temp dir exists
 mkdir -p "$PREFIX/tmp"
 
-# --- Environment (matches proot-distro v5 _build_normal_env) ---
 export HOME=/root
 export USER=root
 export SHELL=/bin/bash
@@ -1053,7 +1023,6 @@ export MOZ_FAKE_NO_SANDBOX=1
 export PULSE_SERVER=127.0.0.1
 export PROOT_L2S_DIR="$rootfs/.l2s"
 
-# --- Launch proot with full path ---
 exec "$PROOT_BIN" \\
   --kill-on-exit \\
   --link2symlink \\
@@ -1171,8 +1140,8 @@ show_codespace_info() {
   echo "  Enter  → Start / Restart"
   echo "  d      → Delete"
   echo "  t      → Terminate (stop)"
-  echo "  e      → Export to .zip"
-  echo "  i      → Import from .zip"
+  echo "  e      → Export to .tar.gz (pigz, multi-core)"
+  echo "  i      → Import from .tar.gz (pigz, multi-core)"
   echo "  q      → Back"
   press_any_key
 }
@@ -1193,7 +1162,7 @@ manage_codespaces_menu() {
       fi
     done
     options+=("+ Create New Codespace")
-    options+=("↓ Import Codespace from .zip")
+    options+=("↓ Import Codespace from .tar.gz")
 
     arrow_menu "Manage Codespaces" "${options[@]}"
     local action="${ARROW_MENU_RESULT%%:*}"
