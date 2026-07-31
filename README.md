@@ -67,8 +67,8 @@ It is useful because:
 ## Installation
 
 ```bash
-pkg update && pkg upgrade -y
-pkg install proot proot-distro git -y
+apt update && apt upgrade -y
+apt install proot proot-distro pigz git -y
 
 git clone https://github.com/giriaryan694-a11y/TermuxCodeSpace.git
 cd TermuxCodeSpace
