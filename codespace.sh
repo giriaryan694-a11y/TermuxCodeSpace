@@ -120,7 +120,7 @@ arrow_menu() {
     done
 
     echo
-    echo -e "${YELLOW}↑/↓ move   Enter select   d delete   t terminate   q back${RESET}"
+    echo -e "${YELLOW}↑/↓ move   Enter select   d delete   t terminate   e export   i import   q back${RESET}"
 
     key=$(read_key)
     case "$key" in
@@ -129,6 +129,8 @@ arrow_menu() {
       "")        ARROW_MENU_RESULT="select:$sel"; return 0 ;;
       d|D)       ARROW_MENU_RESULT="delete:$sel"; return 0 ;;
       t|T)       ARROW_MENU_RESULT="terminate:$sel"; return 0 ;;
+      e|E)       ARROW_MENU_RESULT="export:$sel"; return 0 ;;
+      i|I)       ARROW_MENU_RESULT="import:$sel"; return 0 ;;
       q|Q)       ARROW_MENU_RESULT="back:-1"; return 0 ;;
     esac
   done
@@ -733,6 +735,217 @@ write_codeserver_settings() {
 SETTINGS
 }
 
+# ================================================================== #
+# export_codespace — pack a codespace's rootfs into a .zip archive
+# ================================================================== #
+export_codespace() {
+  local name="$1"
+  clear; banner
+  echo -e "${BOLD}Export Codespace: $name${RESET}"
+  echo
+
+  if [[ ! -d "$CODESPACES_DIR/$name" ]]; then
+    echo -e "${RED}Codespace '$name' not found.${RESET}"
+    press_any_key; return
+  fi
+
+  if ! command -v zip >/dev/null 2>&1; then
+    echo -e "${RED}'zip' is not installed.${RESET}"
+    echo "Install it with:  pkg install zip -y   (or, inside Ubuntu: apt install zip -y)"
+    press_any_key; return
+  fi
+
+  if is_running "$name"; then
+    echo -e "${YELLOW}'$name' is currently running. For a clean, consistent export it's${RESET}"
+    echo -e "${YELLOW}recommended to stop it first.${RESET}"
+    read -rp "Stop it now before exporting? [Y/n]: " stop_first
+    if [[ ! "$stop_first" =~ ^[Nn]$ ]]; then
+      stop_codespace "$name"
+    fi
+    echo
+  fi
+
+  read -rp "Export path (directory or full .zip file path) [default: $HOME/${name}.zip]: " export_path
+  export_path="${export_path:-$HOME/${name}.zip}"
+  export_path="${export_path/#\~/$HOME}"
+
+  # If the user gave an existing directory, drop the archive inside it
+  if [[ -d "$export_path" ]]; then
+    export_path="${export_path%/}/${name}.zip"
+  fi
+
+  # Make sure it ends in .zip
+  [[ "$export_path" == *.zip ]] || export_path="${export_path}.zip"
+
+  local export_dir
+  export_dir="$(dirname "$export_path")"
+  mkdir -p "$export_dir"
+
+  if [[ -e "$export_path" ]]; then
+    read -rp "File '$export_path' already exists. Overwrite? [y/N]: " overwrite
+    if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      press_any_key; return
+    fi
+    rm -f "$export_path"
+  fi
+
+  # Stash a small metadata file (name/port/password) so import can restore them
+  local tmp_meta_dir
+  tmp_meta_dir=$(mktemp -d)
+  {
+    echo "name=$name"
+    echo "port=$(cat "$META_DIR/$name.port" 2>/dev/null)"
+    echo "pass=$(cat "$META_DIR/$name.pass" 2>/dev/null)"
+  } > "$tmp_meta_dir/codespace.meta"
+
+  echo -e "${CYAN}[*] Zipping codespace '$name' — this can take a while for large images...${RESET}"
+
+  (
+    cd "$CODESPACES_DIR" || exit 1
+    zip -r -y -q "$export_path" "$name"
+  )
+  local zip_status=$?
+
+  if [[ $zip_status -ne 0 || ! -f "$export_path" ]]; then
+    echo -e "${RED}Export failed.${RESET}"
+    rm -rf "$tmp_meta_dir"
+    press_any_key; return
+  fi
+
+  # Append the metadata file to the archive (stored at the zip root)
+  zip -q -j "$export_path" "$tmp_meta_dir/codespace.meta"
+  rm -rf "$tmp_meta_dir"
+
+  local size
+  size=$(du -h "$export_path" 2>/dev/null | cut -f1)
+
+  echo
+  echo -e "${GREEN}${BOLD}Export complete.${RESET}"
+  echo -e "  File: $export_path"
+  [[ -n "$size" ]] && echo -e "  Size: $size"
+  press_any_key
+}
+
+# ================================================================== #
+# import_codespace — restore a codespace from a .zip archive
+# ================================================================== #
+import_codespace() {
+  clear; banner
+  echo -e "${BOLD}Import Codespace${RESET}"
+  echo
+
+  if ! command -v unzip >/dev/null 2>&1; then
+    echo -e "${RED}'unzip' is not installed.${RESET}"
+    echo "Install it with:  pkg install unzip -y   (or, inside Ubuntu: apt install unzip -y)"
+    press_any_key; return
+  fi
+
+  read -rp "Path to codespace .zip file: " zip_path
+  zip_path="${zip_path/#\~/$HOME}"
+
+  if [[ ! -f "$zip_path" ]]; then
+    echo -e "${RED}File not found: $zip_path${RESET}"
+    press_any_key; return
+  fi
+
+  if ! unzip -l "$zip_path" >/dev/null 2>&1; then
+    echo -e "${RED}'$zip_path' does not look like a valid .zip file.${RESET}"
+    press_any_key; return
+  fi
+
+  # Best-effort read of the metadata file written by export_codespace
+  local meta name_in_zip port_in_zip pass_in_zip
+  meta=$(unzip -p "$zip_path" codespace.meta 2>/dev/null) || true
+  name_in_zip=$(echo "$meta" | grep '^name=' | cut -d= -f2-)
+  port_in_zip=$(echo "$meta" | grep '^port=' | cut -d= -f2-)
+  pass_in_zip=$(echo "$meta" | grep '^pass=' | cut -d= -f2-)
+
+  local default_name="${name_in_zip:-imported}"
+  local new_name
+  read -rp "Name for the imported codespace [default: $default_name]: " new_name
+  new_name="${new_name:-$default_name}"
+  new_name=$(echo "$new_name" | tr -cd 'A-Za-z0-9_-')
+
+  if [[ -z "$new_name" ]]; then
+    echo -e "${RED}Invalid name.${RESET}"
+    press_any_key; return
+  fi
+  if [[ -d "$CODESPACES_DIR/$new_name" ]]; then
+    echo -e "${RED}A codespace named '$new_name' already exists.${RESET}"
+    press_any_key; return
+  fi
+
+  echo -e "${CYAN}[*] Extracting archive — this can take a while for large images...${RESET}"
+  local tmp_extract
+  tmp_extract=$(mktemp -d)
+
+  if ! unzip -q "$zip_path" -d "$tmp_extract"; then
+    echo -e "${RED}Extraction failed.${RESET}"
+    rm -rf "$tmp_extract"
+    press_any_key; return
+  fi
+
+  # The zip was created from inside CODESPACES_DIR, so the rootfs should be
+  # the single top-level directory (name matches the exported codespace name).
+  local extracted_dir
+  if [[ -n "$name_in_zip" && -d "$tmp_extract/$name_in_zip" ]]; then
+    extracted_dir="$tmp_extract/$name_in_zip"
+  else
+    extracted_dir=$(find "$tmp_extract" -mindepth 1 -maxdepth 1 -type d | head -n1)
+  fi
+
+  if [[ -z "$extracted_dir" || ! -d "$extracted_dir" ]]; then
+    echo -e "${RED}Could not find a codespace rootfs inside the zip.${RESET}"
+    rm -rf "$tmp_extract"
+    press_any_key; return
+  fi
+
+  mv "$extracted_dir" "$CODESPACES_DIR/$new_name"
+  rm -rf "$tmp_extract"
+
+  if [[ -n "$name_in_zip" && "$name_in_zip" != "$new_name" ]]; then
+    fix_l2s_symlinks "$CODESPACES_DIR/$name_in_zip" "$CODESPACES_DIR/$new_name"
+  fi
+  prepare_codespace_rootfs "$CODESPACES_DIR/$new_name"
+  write_codeserver_settings "$CODESPACES_DIR/$new_name"
+
+  local port_prompt="Port (leave blank to auto-assign"
+  [[ -n "$port_in_zip" ]] && port_prompt+=", previous was $port_in_zip"
+  port_prompt+="): "
+  local user_port
+  read -rp "$port_prompt" user_port
+  local req_port="${user_port:-$port_in_zip}"
+
+  local port
+  port=$(find_free_port "$req_port")
+  if [[ -z "$port" ]]; then
+    echo -e "${RED}No free ports available in range ${PORT_RANGE_START}-${PORT_RANGE_END}.${RESET}"
+    rm -rf "$CODESPACES_DIR/$new_name"
+    press_any_key; return
+  fi
+
+  local pass="${pass_in_zip:-$(random_password)}"
+
+  local cfg_dir="$CODESPACES_DIR/$new_name/root/.config/code-server"
+  mkdir -p "$cfg_dir"
+  cat > "$cfg_dir/config.yaml" <<CFG
+bind-addr: 0.0.0.0:${port}
+auth: password
+password: ${pass}
+cert: false
+CFG
+
+  echo "$port" > "$META_DIR/$new_name.port"
+  echo "$pass" > "$META_DIR/$new_name.pass"
+
+  echo
+  echo -e "${GREEN}${BOLD}Codespace '$new_name' imported successfully.${RESET}"
+  echo -e "  Port:     $port"
+  echo -e "  Password: $pass"
+  press_any_key
+}
+
 create_codespace() {
   clear; banner
   echo -e "${BOLD}Create a new Codespace${RESET}"
@@ -958,6 +1171,8 @@ show_codespace_info() {
   echo "  Enter  → Start / Restart"
   echo "  d      → Delete"
   echo "  t      → Terminate (stop)"
+  echo "  e      → Export to .zip"
+  echo "  i      → Import from .zip"
   echo "  q      → Back"
   press_any_key
 }
@@ -978,6 +1193,7 @@ manage_codespaces_menu() {
       fi
     done
     options+=("+ Create New Codespace")
+    options+=("↓ Import Codespace from .zip")
 
     arrow_menu "Manage Codespaces" "${options[@]}"
     local action="${ARROW_MENU_RESULT%%:*}"
@@ -988,6 +1204,8 @@ manage_codespaces_menu() {
       select)
         if [[ $idx -eq ${#names[@]} ]]; then
           create_codespace
+        elif [[ $idx -eq $(( ${#names[@]} + 1 )) ]]; then
+          import_codespace
         else
           show_codespace_info "${names[$idx]}"
           if ! is_running "${names[$idx]}"; then
@@ -1004,6 +1222,18 @@ manage_codespaces_menu() {
           stop_codespace "${names[$idx]}"
           press_any_key
         fi
+        ;;
+      export)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          export_codespace "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to export first.${RESET}"
+          press_any_key
+        fi
+        ;;
+      import)
+        import_codespace
         ;;
     esac
   done
