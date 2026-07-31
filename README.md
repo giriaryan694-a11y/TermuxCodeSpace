@@ -120,6 +120,8 @@ Example codespace list:
 | `d`       | Delete a codespace          |
 | `t`       | Stop a codespace            |
 | `q`       | Go back                     |
+| `i`       | Import codespace            |
+| `e`       | Export codespace            |
 
 When creating a codespace, you will be asked for:
 
