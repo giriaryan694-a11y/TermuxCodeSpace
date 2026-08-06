@@ -56,29 +56,22 @@ mkdir -p "$PREFIX/tmp"
 # ================================================================== #
 # PROOT_BIND_EXCLUDES — directories that proot creates inside the
 # rootfs as bind-mount targets with 000 permissions.
-#
-# These are Android system paths, NOT part of the Ubuntu filesystem.
-# proot materialises them at runtime via --bind flags; they must be
-# excluded from export archives.
-#
-# Ref: https://github.com/termux/proot-distro/issues/683
-# Ref: proot-distro backup _fix_permissions() in commands/backup.py
 # ================================================================== #
 PROOT_BIND_EXCLUDES=(
-  ".l2s"           # proot link2symlink backing store (recreated at runtime)
-  "data"           # Android /data — com.termux bind mounts
-  "dev"            # device files (proot binds host /dev at runtime)
-  "proc"           # /proc (proot binds host /proc at runtime)
-  "sys"            # /sys (proot binds host /sys at runtime)
-  "storage"        # Android storage
-  "sdcard"         # Android sdcard symlink
-  "system"         # Android system partition
-  "system_ext"     # Android system_ext partition
-  "apex"           # Android APEX modules
-  "vendor"         # Android vendor partition
-  "product"        # Android product partition
-  "odm"            # Android ODM partition
-  "linkerconfig"   # Android linker configuration
+  ".l2s"           
+  "data"           
+  "dev"            
+  "proc"           
+  "sys"            
+  "storage"        
+  "sdcard"         
+  "system"         
+  "system_ext"     
+  "apex"           
+  "vendor"         
+  "product"        
+  "odm"            
+  "linkerconfig"   
 )
 
 # ------------------------------------------------------------------ #
@@ -148,13 +141,14 @@ arrow_menu() {
     done
 
     echo
-    echo -e "${YELLOW}↑/↓ move   Enter select   d delete   t terminate   e export   i import   q back${RESET}"
+    echo -e "${YELLOW}↑/↓ move   Enter select   c cli   d delete   t terminate   e export   i import   q back${RESET}"
 
     key=$(read_key)
     case "$key" in
       $'\x1b[A') sel=$(( (sel - 1 + count) % count )) ;;
       $'\x1b[B') sel=$(( (sel + 1) % count )) ;;
       "")        ARROW_MENU_RESULT="select:$sel"; return 0 ;;
+      c|C)       ARROW_MENU_RESULT="cli:$sel"; return 0 ;;
       d|D)       ARROW_MENU_RESULT="delete:$sel"; return 0 ;;
       t|T)       ARROW_MENU_RESULT="terminate:$sel"; return 0 ;;
       e|E)       ARROW_MENU_RESULT="export:$sel"; return 0 ;;
@@ -564,13 +558,6 @@ fix_l2s_symlinks() {
 
 # ================================================================== #
 # fix_rootfs_permissions — make chmod-000 subtrees readable
-#
-# proot creates bind-mount target directories with 000 permissions.
-# This mirrors proot-distro backup's _fix_permissions() so tar can
-# traverse the entire rootfs without "Permission denied" errors.
-#
-# Ref: https://github.com/termux/proot-distro/issues/683
-# Ref: proot-distro commands/backup.py _fix_permissions()
 # ================================================================== #
 fix_rootfs_permissions() {
   local rootfs="$1"
@@ -591,9 +578,6 @@ prepare_codespace_rootfs() {
   mkdir -p "$rootfs/dev/shm"
   mkdir -p "$rootfs/run"
 
-  # Recreate directories that proot expects as bind-mount targets.
-  # These are excluded from export archives (Android artifacts)
-  # but proot needs them to exist for --bind to work.
   mkdir -p "$rootfs/proc"
   mkdir -p "$rootfs/sys"
 
@@ -683,14 +667,7 @@ require_pigz() {
 }
 
 # ================================================================== #
-# export_codespace — FIXED
-#
-# FIX 1: fix_rootfs_permissions() before tar (chmod-000 → u+rx)
-# FIX 2: --exclude for all proot bind-mount artifact paths
-# FIX 3: --ignore-failed-read --warning=no-failed-read safety net
-# FIX 4: tar exit code 1 = warnings (OK); only >= 2 = real failure
-#
-# Ref: https://github.com/termux/proot-distro/issues/683
+# export_codespace
 # ================================================================== #
 export_codespace() {
   local name="$1"
@@ -743,17 +720,14 @@ export_codespace() {
   local cores
   cores=$(prompt_core_count)
 
-  # ---- FIX 1: Fix chmod-000 permissions ----
   fix_rootfs_permissions "$CODESPACES_DIR/$name"
 
-  # ---- FIX 2: Build --exclude flags ----
   local tar_excludes=()
   local p
   for p in "${PROOT_BIND_EXCLUDES[@]}"; do
     tar_excludes+=("--exclude=${name}/${p}")
   done
 
-  # ---- Metadata: write into temp dir, append via second -C ----
   local tmp_meta_dir
   tmp_meta_dir=$(mktemp -d)
   {
@@ -764,7 +738,6 @@ export_codespace() {
 
   echo -e "${CYAN}[*] Compressing codespace '$name' with pigz (${cores} core(s)) — this can take a while for large images...${RESET}"
 
-  # ---- FIX 3 & 4: tar with excludes + ignore-failed-read ----
   tar --ignore-failed-read --warning=no-failed-read \
       "${tar_excludes[@]}" \
       -cf - -C "$CODESPACES_DIR" "$name" \
@@ -773,7 +746,6 @@ export_codespace() {
   local pipe_status=("${PIPESTATUS[@]}")
   rm -rf "$tmp_meta_dir"
 
-  # tar exit 1 = "some files differ" (acceptable); >= 2 = real failure
   if [[ "${pipe_status[0]}" -ge 2 || "${pipe_status[1]}" -ne 0 || ! -s "$export_path" ]]; then
     echo -e "${RED}Export failed (tar=${pipe_status[0]}, pigz=${pipe_status[1]}).${RESET}"
     rm -f "$export_path"
@@ -796,11 +768,7 @@ export_codespace() {
 }
 
 # ================================================================== #
-# import_codespace — FIXED
-#
-# After extraction, prepare_codespace_rootfs() recreates all the
-# directories that were excluded from the archive (dev, proc, sys,
-# .l2s, etc.) so proot's --bind flags work correctly.
+# import_codespace
 # ================================================================== #
 import_codespace() {
   clear; banner
@@ -882,7 +850,6 @@ import_codespace() {
     fix_l2s_symlinks "$CODESPACES_DIR/$name_in_zip" "$CODESPACES_DIR/$new_name"
   fi
 
-  # Recreate all directories excluded from the archive
   prepare_codespace_rootfs "$CODESPACES_DIR/$new_name"
   write_codeserver_settings "$CODESPACES_DIR/$new_name"
 
@@ -1118,6 +1085,62 @@ terminate_all() {
   press_any_key
 }
 
+# ================================================================== #
+# cli_codespace — Direct terminal CLI access via proot
+# ================================================================== #
+cli_codespace() {
+  local name="$1"
+  local rootfs="$CODESPACES_DIR/$name"
+
+  clear
+  banner
+  echo -e "${CYAN}[*] Entering CLI for codespace '$name'...${RESET}"
+  echo -e "${YELLOW}Type 'exit' or press Ctrl+D to return to the menu.${RESET}"
+  echo
+  sleep 1
+
+  prepare_codespace_rootfs "$rootfs"
+
+  # Use a subshell to isolate environment variable modifications
+  (
+    unset LD_PRELOAD
+    mkdir -p "$PREFIX/tmp"
+
+    export HOME=/root
+    export USER=root
+    export SHELL=/bin/bash
+    export TERM="${TERM:-xterm-256color}"
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PREFIX/bin"
+    export LANG=C.UTF-8
+    export MOZ_FAKE_NO_SANDBOX=1
+    export PULSE_SERVER=127.0.0.1
+    export PROOT_L2S_DIR="$rootfs/.l2s"
+
+    exec "$PROOT_BIN" \
+      --kill-on-exit \
+      --link2symlink \
+      --sysvipc \
+      -L \
+      --change-id=0:0 \
+      --kernel-release="6.17.0-PRoot-Distro" \
+      --rootfs="$rootfs" \
+      --cwd=/root \
+      --bind=/dev \
+      --bind=/proc \
+      --bind=/sys \
+      --bind=/dev/urandom:/dev/random \
+      --bind=/proc/self/fd:/dev/fd \
+      --bind="$rootfs/tmp:/dev/shm" \
+      --bind="$PREFIX" \
+      --bind="$PREFIX/tmp:/tmp" \
+      /bin/bash
+  )
+  
+  echo
+  echo -e "${GREEN}[*] Exited CLI for codespace '$name'.${RESET}"
+  press_any_key
+}
+
 show_codespace_info() {
   local name="$1"
   clear; banner
@@ -1138,6 +1161,7 @@ show_codespace_info() {
   echo
   echo -e "${YELLOW}Actions:${RESET}"
   echo "  Enter  → Start / Restart"
+  echo "  c      → CLI access (Terminal)"
   echo "  d      → Delete"
   echo "  t      → Terminate (stop)"
   echo "  e      → Export to .tar.gz (pigz, multi-core)"
@@ -1170,6 +1194,15 @@ manage_codespaces_menu() {
 
     case "$action" in
       back) return ;;
+      cli)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          cli_codespace "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to access CLI first.${RESET}"
+          press_any_key
+        fi
+        ;;
       select)
         if [[ $idx -eq ${#names[@]} ]]; then
           create_codespace
