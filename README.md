@@ -117,6 +117,7 @@ Example codespace list:
 | --------- | --------------------------- |
 | `↑` / `↓` | Navigate                    |
 | `Enter`   | Select or start a codespace |
+| `c`       | Connect to codespace shell  |
 | `d`       | Delete a codespace          |
 | `t`       | Stop a codespace            |
 | `q`       | Go back                     |
@@ -129,6 +130,36 @@ When creating a codespace, you will be asked for:
 * **Port** — leave blank for automatic assignment, or enter your own
 
 The script generates a unique password, writes the `code-server` config, and starts the server automatically.
+
+## Direct Shell Access
+
+For quick work on your phone, you can connect directly to a codespace without opening VS Code.
+
+Select a running codespace and press:
+
+```text
+c
+```
+
+You will enter the isolated Ubuntu environment directly from the Termux terminal.
+
+```text
+Connecting to "myproject"...
+
+root@myproject:~#
+```
+
+When finished, simply run:
+
+```bash
+exit
+```
+
+or press **Ctrl+D**.
+
+You will automatically return to the TermuxCodeSpace manager.
+
+This provides a lightweight workflow for package management, Git operations, compiling code, and other terminal-based tasks without requiring a browser or large display.
 
 ## Accessing code-server
 
