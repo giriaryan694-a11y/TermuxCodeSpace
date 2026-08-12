@@ -43,6 +43,12 @@ BASE_ROOTFS="$(detect_base_rootfs)"
 PORT_RANGE_START=2000
 PORT_RANGE_END=3000
 
+# Range used for the per-codespace network-logging/filtering proxy
+PROXY_PORT_RANGE_START=8000
+PROXY_PORT_RANGE_END=9000
+
+NETPROXY_SCRIPT="$BASE_DIR/proxy_server.py"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -141,7 +147,8 @@ arrow_menu() {
     done
 
     echo
-    echo -e "${YELLOW}↑/↓ move   Enter select   c cli   d delete   t terminate   e export   i import   q back${RESET}"
+    echo -e "${YELLOW}↑/↓ move   Enter select   c cli   n netlog   b domains   R restrict${RESET}"
+    echo -e "${YELLOW}d delete   t terminate   e export   i import   q back${RESET}"
 
     key=$(read_key)
     case "$key" in
@@ -149,6 +156,9 @@ arrow_menu() {
       $'\x1b[B') sel=$(( (sel + 1) % count )) ;;
       "")        ARROW_MENU_RESULT="select:$sel"; return 0 ;;
       c|C)       ARROW_MENU_RESULT="cli:$sel"; return 0 ;;
+      n|N)       ARROW_MENU_RESULT="netlog:$sel"; return 0 ;;
+      b|B)       ARROW_MENU_RESULT="domains:$sel"; return 0 ;;
+      r|R)       ARROW_MENU_RESULT="restrict:$sel"; return 0 ;;
       d|D)       ARROW_MENU_RESULT="delete:$sel"; return 0 ;;
       t|T)       ARROW_MENU_RESULT="terminate:$sel"; return 0 ;;
       e|E)       ARROW_MENU_RESULT="export:$sel"; return 0 ;;
@@ -195,6 +205,40 @@ find_free_port() {
   local port
   for (( port=PORT_RANGE_START; port<=PORT_RANGE_END; port++ )); do
     if is_port_free "$port"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Same idea as is_port_free/find_free_port but for the per-codespace
+# network-logging proxy, tracked in *.proxyport files.
+is_proxy_port_free() {
+  local port="$1"
+  if grep -qs "^${port}$" "$META_DIR"/*.proxyport 2>/dev/null; then
+    return 1
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tlnH 2>/dev/null | grep -q ":${port} "; then
+      return 1
+    fi
+  elif command -v netstat >/dev/null 2>&1; then
+    if netstat -tln 2>/dev/null | grep -q ":${port} "; then
+      return 1
+    fi
+  else
+    if (echo > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+find_free_proxy_port() {
+  local port
+  for (( port=PROXY_PORT_RANGE_START; port<=PROXY_PORT_RANGE_END; port++ )); do
+    if is_proxy_port_free "$port"; then
       echo "$port"
       return 0
     fi
@@ -529,6 +573,405 @@ device_ip() {
     | grep -v '127.0.0.1' \
     | head -n1 \
     | awk '{print $2}'
+}
+
+# ================================================================== #
+# Network logging / filtering proxy
+#
+# Each codespace gets its own explicit forward proxy that runs on the
+# Termux host (NOT inside proot, and NOT as root — it's a plain
+# python3 process owned by your normal Termux user). The launcher sets
+# http_proxy/https_proxy inside the container so its traffic routes
+# through it.
+#
+# Because this is an explicit proxy rather than a transparent
+# iptables redirect, it stays fully rootless — but it can only see
+# and filter what obeys http_proxy/https_proxy (i.e. plain HTTP and
+# HTTPS via CONNECT). It logs and can allow/deny at the domain level
+# only; it does not decrypt TLS, so paths/bodies of HTTPS requests
+# are never inspected. Tools that ignore proxy env vars, or that talk
+# raw TCP/UDP/DNS-over-something-else, will bypass it.
+# ================================================================== #
+ensure_proxy_script() {
+  cat > "$NETPROXY_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Termux CodeSpace network proxy
+Made By Aryan Giri | giriaryan694-a11y
+
+A small forward proxy used to log outbound network activity from a
+codespace and optionally enforce a domain allow/deny policy. Domain
+matching only: HTTPS is tunnelled (CONNECT) without decryption, so
+only the requested host:port is ever visible or filterable.
+"""
+import argparse
+import datetime
+import select
+import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def log_line(logfile, verdict, method, host, port):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = "[{}] {:5} {:8} {}:{}\n".format(ts, verdict, method, host, port)
+    try:
+        with open(logfile, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def read_domain_list(path):
+    domains = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    domains.append(line.lower())
+    except OSError:
+        pass
+    return domains
+
+
+def read_mode(path):
+    try:
+        with open(path) as f:
+            mode = f.read().strip().lower()
+            if mode in ("open", "restricted"):
+                return mode
+    except OSError:
+        pass
+    return "open"
+
+
+def host_matches(host, pattern):
+    host = host.lower()
+    pattern = pattern.lower()
+    if pattern.startswith("."):
+        return host == pattern[1:] or host.endswith(pattern)
+    return host == pattern or host.endswith("." + pattern)
+
+
+def is_allowed(host, args):
+    mode = read_mode(args.mode_file)
+    blocklist = read_domain_list(args.blocklist)
+
+    if any(host_matches(host, p) for p in blocklist):
+        return False, mode
+
+    if mode == "restricted":
+        allowlist = read_domain_list(args.allowlist)
+        return any(host_matches(host, p) for p in allowlist), mode
+
+    return True, mode
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    args = None  # set in main()
+
+    def log_message(self, fmt, *a):
+        pass  # keep our own log format instead of stderr access logs
+
+    def _target_from_path(self):
+        from urllib.parse import urlparse
+        parsed = urlparse(self.path)
+        host = parsed.hostname or self.headers.get("Host", "").split(":")[0]
+        port = parsed.port or 80
+        return host, port
+
+    def do_CONNECT(self):
+        try:
+            host, port_s = self.path.rsplit(":", 1)
+            port = int(port_s)
+        except ValueError:
+            self.send_error(400, "Bad CONNECT target")
+            return
+
+        allowed, _ = is_allowed(host, self.args)
+        log_line(self.args.log, "ALLOW" if allowed else "DENY", "CONNECT", host, port)
+
+        if not allowed:
+            self.send_response(403, "Forbidden by codespace network policy")
+            self.end_headers()
+            return
+
+        try:
+            upstream = socket.create_connection((host, port), timeout=15)
+        except OSError as e:
+            self.send_error(502, "Could not connect upstream: {}".format(e))
+            return
+
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        self._relay(self.connection, upstream)
+
+    def _handle_plain(self, method):
+        host, port = self._target_from_path()
+        allowed, _ = is_allowed(host, self.args)
+        log_line(self.args.log, "ALLOW" if allowed else "DENY", method, host, port)
+
+        if not allowed:
+            self.send_response(403, "Forbidden by codespace network policy")
+            self.end_headers()
+            try:
+                self.wfile.write(b"Blocked by codespace network policy\n")
+            except OSError:
+                pass
+            return
+
+        try:
+            import urllib.request
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else None
+            req = urllib.request.Request(self.path, data=body, method=method)
+            for k, v in self.headers.items():
+                if k.lower() in ("proxy-connection", "connection"):
+                    continue
+                req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() in ("transfer-encoding", "connection"):
+                        continue
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(resp.read())
+        except Exception as e:
+            try:
+                self.send_error(502, "Upstream error: {}".format(e))
+            except Exception:
+                pass
+
+    def do_GET(self): self._handle_plain("GET")
+    def do_POST(self): self._handle_plain("POST")
+    def do_PUT(self): self._handle_plain("PUT")
+    def do_DELETE(self): self._handle_plain("DELETE")
+    def do_HEAD(self): self._handle_plain("HEAD")
+    def do_OPTIONS(self): self._handle_plain("OPTIONS")
+    def do_PATCH(self): self._handle_plain("PATCH")
+
+    @staticmethod
+    def _relay(a, b):
+        sockets = [a, b]
+        try:
+            while True:
+                r, _, x = select.select(sockets, [], sockets, 60)
+                if x or not r:
+                    break
+                closed = False
+                for s in r:
+                    other = b if s is a else a
+                    data = s.recv(65536)
+                    if not data:
+                        closed = True
+                        break
+                    other.sendall(data)
+                if closed:
+                    break
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--log", required=True)
+    p.add_argument("--mode-file", required=True)
+    p.add_argument("--blocklist", required=True)
+    p.add_argument("--allowlist", required=True)
+    args = p.parse_args()
+
+    ProxyHandler.args = args
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), ProxyHandler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
+ensure_network_files() {
+  local name="$1"
+  [[ -f "$META_DIR/$name.netmode" ]]   || echo "open" > "$META_DIR/$name.netmode"
+  [[ -f "$META_DIR/$name.blocklist" ]] || : > "$META_DIR/$name.blocklist"
+  [[ -f "$META_DIR/$name.allowlist" ]] || : > "$META_DIR/$name.allowlist"
+  [[ -f "$META_DIR/$name.netlog" ]]    || : > "$META_DIR/$name.netlog"
+}
+
+is_proxy_running() {
+  local name="$1"
+  local pidfile="$META_DIR/$name.proxy.pid"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+start_network_proxy() {
+  local name="$1"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${YELLOW}[!] python3 not found on host — network logging/filtering disabled for '$name'.${RESET}"
+    echo -e "${YELLOW}    Install it with: pkg install python -y${RESET}"
+    return 1
+  fi
+
+  ensure_proxy_script
+  ensure_network_files "$name"
+
+  if is_proxy_running "$name"; then
+    return 0
+  fi
+
+  local proxy_port=""
+  if [[ -f "$META_DIR/$name.proxyport" ]]; then
+    proxy_port=$(cat "$META_DIR/$name.proxyport")
+    is_proxy_port_free "$proxy_port" || proxy_port=""
+  fi
+  [[ -z "$proxy_port" ]] && proxy_port=$(find_free_proxy_port)
+
+  if [[ -z "$proxy_port" ]]; then
+    echo -e "${RED}No free proxy ports available in range ${PROXY_PORT_RANGE_START}-${PROXY_PORT_RANGE_END}.${RESET}"
+    return 1
+  fi
+  echo "$proxy_port" > "$META_DIR/$name.proxyport"
+
+  nohup python3 "$NETPROXY_SCRIPT" \
+    --port "$proxy_port" \
+    --log "$META_DIR/$name.netlog" \
+    --mode-file "$META_DIR/$name.netmode" \
+    --blocklist "$META_DIR/$name.blocklist" \
+    --allowlist "$META_DIR/$name.allowlist" \
+    > "$META_DIR/$name.proxy.log" 2>&1 &
+  echo $! > "$META_DIR/$name.proxy.pid"
+  sleep 1
+
+  if ! is_proxy_running "$name"; then
+    echo -e "${YELLOW}[!] Network proxy failed to start for '$name'; traffic will bypass logging/filtering.${RESET}"
+    echo -e "${YELLOW}    Check: cat $META_DIR/$name.proxy.log${RESET}"
+    return 1
+  fi
+  return 0
+}
+
+stop_network_proxy() {
+  local name="$1"
+  local pidfile="$META_DIR/$name.proxy.pid"
+  if is_proxy_running "$name"; then
+    local pid
+    pid=$(cat "$pidfile")
+    kill "$pid" 2>/dev/null
+    sleep 1
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$pidfile"
+}
+
+view_network_log() {
+  local name="$1"
+  ensure_network_files "$name"
+  clear; banner
+  echo -e "${BOLD}Network log: $name${RESET}"
+  local mode
+  mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
+  if is_proxy_running "$name"; then
+    echo -e "  Proxy:  ${GREEN}running${RESET} on 127.0.0.1:$(cat "$META_DIR/$name.proxyport" 2>/dev/null)"
+  else
+    echo -e "  Proxy:  ${RED}not running${RESET} (starts the codespace to enable logging)"
+  fi
+  if [[ "$mode" == "restricted" ]]; then
+    echo -e "  Mode:   ${RED}restricted${RESET}"
+  else
+    echo -e "  Mode:   ${GREEN}open${RESET}"
+  fi
+  echo
+  echo -e "${YELLOW}Live-tailing $META_DIR/$name.netlog — press Ctrl+C to return.${RESET}"
+  echo
+
+  trap ' ' INT
+  tail -n 40 -f "$META_DIR/$name.netlog" &
+  local tail_pid=$!
+  trap "kill $tail_pid 2>/dev/null" INT
+  wait "$tail_pid" 2>/dev/null
+  trap - INT
+}
+
+manage_domain_lists() {
+  local name="$1"
+  ensure_network_files "$name"
+  while true; do
+    clear; banner
+    echo -e "${BOLD}Domain policy: $name${RESET}"
+    local mode
+    mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
+    if [[ "$mode" == "restricted" ]]; then
+      echo -e "  Mode: ${RED}restricted (default-deny)${RESET}"
+    else
+      echo -e "  Mode: ${GREEN}open (default-allow)${RESET}"
+    fi
+    echo
+    echo -e "${BOLD}Blocklist${RESET} (always denied, both modes):"
+    if [[ -s "$META_DIR/$name.blocklist" ]]; then
+      nl -ba "$META_DIR/$name.blocklist"
+    else
+      echo "  (empty)"
+    fi
+    echo
+    echo -e "${BOLD}Allowlist${RESET} (only consulted in restricted mode):"
+    if [[ -s "$META_DIR/$name.allowlist" ]]; then
+      nl -ba "$META_DIR/$name.allowlist"
+    else
+      echo "  (empty)"
+    fi
+    echo
+    echo -e "${YELLOW}a) block a domain      x) unblock (remove from blocklist)${RESET}"
+    echo -e "${YELLOW}w) allow a domain       y) remove from allowlist${RESET}"
+    echo -e "${YELLOW}q) back${RESET}"
+    echo
+    read -rp "> " choice
+    case "$choice" in
+      a) read -rp "Domain to block (e.g. ads.example.com, or .example.com for all subdomains): " d
+         [[ -n "$d" ]] && echo "$d" >> "$META_DIR/$name.blocklist" ;;
+      x) read -rp "Line number to remove from blocklist: " ln
+         [[ "$ln" =~ ^[0-9]+$ ]] && sed -i "${ln}d" "$META_DIR/$name.blocklist" ;;
+      w) read -rp "Domain to allow in restricted mode: " d
+         [[ -n "$d" ]] && echo "$d" >> "$META_DIR/$name.allowlist" ;;
+      y) read -rp "Line number to remove from allowlist: " ln
+         [[ "$ln" =~ ^[0-9]+$ ]] && sed -i "${ln}d" "$META_DIR/$name.allowlist" ;;
+      q|Q) return ;;
+    esac
+  done
+}
+
+toggle_restricted_mode() {
+  local name="$1"
+  ensure_network_files "$name"
+  local mode
+  mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
+  clear; banner
+  if [[ "$mode" == "restricted" ]]; then
+    echo "open" > "$META_DIR/$name.netmode"
+    echo -e "${GREEN}Network access for '$name' set back to OPEN (blocklist still enforced).${RESET}"
+  else
+    echo "restricted" > "$META_DIR/$name.netmode"
+    echo -e "${RED}Network access for '$name' set to RESTRICTED (default-deny).${RESET}"
+    echo -e "${YELLOW}Only domains in its allowlist ('b' menu) will be reachable. Press R again to go back to open.${RESET}"
+  fi
+  echo -e "${CYAN}(Takes effect immediately — no restart needed.)${RESET}"
+  press_any_key
 }
 
 # ================================================================== #
@@ -973,6 +1416,19 @@ start_codespace() {
     prepare_codespace_rootfs "$rootfs"
     write_codeserver_settings "$rootfs"
 
+    start_network_proxy "$name"
+    local proxy_port="" proxy_env=""
+    [[ -f "$META_DIR/$name.proxyport" ]] && proxy_port=$(cat "$META_DIR/$name.proxyport")
+    if is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+      proxy_env="
+export http_proxy=\"http://127.0.0.1:${proxy_port}\"
+export https_proxy=\"http://127.0.0.1:${proxy_port}\"
+export HTTP_PROXY=\"http://127.0.0.1:${proxy_port}\"
+export HTTPS_PROXY=\"http://127.0.0.1:${proxy_port}\"
+export no_proxy=\"localhost,127.0.0.1\"
+export NO_PROXY=\"localhost,127.0.0.1\""
+    fi
+
     local launcher="$META_DIR/$name.launcher.sh"
     cat > "$launcher" <<LAUNCHER_EOF
 #!/data/data/com.termux/files/usr/bin/bash
@@ -989,6 +1445,7 @@ export LANG=C.UTF-8
 export MOZ_FAKE_NO_SANDBOX=1
 export PULSE_SERVER=127.0.0.1
 export PROOT_L2S_DIR="$rootfs/.l2s"
+${proxy_env}
 
 exec "$PROOT_BIN" \\
   --kill-on-exit \\
@@ -1057,6 +1514,7 @@ stop_codespace() {
     echo -e "${YELLOW}Codespace '$name' was not running.${RESET}"
   fi
   rm -f "$pidfile"
+  stop_network_proxy "$name"
 }
 
 delete_codespace() {
@@ -1100,6 +1558,9 @@ cli_codespace() {
   sleep 1
 
   prepare_codespace_rootfs "$rootfs"
+  start_network_proxy "$name"
+  local proxy_port=""
+  [[ -f "$META_DIR/$name.proxyport" ]] && proxy_port=$(cat "$META_DIR/$name.proxyport")
 
   # Use a subshell to isolate environment variable modifications
   (
@@ -1116,6 +1577,15 @@ cli_codespace() {
     export PULSE_SERVER=127.0.0.1
     export PROOT_L2S_DIR="$rootfs/.l2s"
 
+    if is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+      export http_proxy="http://127.0.0.1:${proxy_port}"
+      export https_proxy="http://127.0.0.1:${proxy_port}"
+      export HTTP_PROXY="http://127.0.0.1:${proxy_port}"
+      export HTTPS_PROXY="http://127.0.0.1:${proxy_port}"
+      export no_proxy="localhost,127.0.0.1"
+      export NO_PROXY="localhost,127.0.0.1"
+    fi
+
     exec "$PROOT_BIN" \
       --kill-on-exit \
       --link2symlink \
@@ -1129,7 +1599,6 @@ cli_codespace() {
       --bind=/proc \
       --bind=/sys \
       --bind=/dev/urandom:/dev/random \
-      --bind=/proc/self/fd:/dev/fd \
       --bind="$rootfs/tmp:/dev/shm" \
       --bind="$PREFIX" \
       --bind="$PREFIX/tmp:/tmp" \
@@ -1159,9 +1628,30 @@ show_codespace_info() {
   echo -e "  Rootfs:   $CODESPACES_DIR/$name"
   echo -e "  Log:      $META_DIR/$name.log"
   echo
+
+  ensure_network_files "$name"
+  local netmode
+  netmode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
+  echo -e "${BOLD}Network${RESET}"
+  if is_proxy_running "$name"; then
+    echo -e "  Proxy:    ${GREEN}running${RESET} on 127.0.0.1:$(cat "$META_DIR/$name.proxyport" 2>/dev/null)"
+  else
+    echo -e "  Proxy:    ${YELLOW}not running${RESET} (starts with the codespace)"
+  fi
+  if [[ "$netmode" == "restricted" ]]; then
+    echo -e "  Mode:     ${RED}restricted${RESET}"
+  else
+    echo -e "  Mode:     ${GREEN}open${RESET}"
+  fi
+  echo -e "  Blocked:  $(wc -l < "$META_DIR/$name.blocklist" 2>/dev/null | tr -d ' ') domain(s)"
+  echo -e "  Netlog:   $META_DIR/$name.netlog"
+  echo
   echo -e "${YELLOW}Actions:${RESET}"
   echo "  Enter  → Start / Restart"
   echo "  c      → CLI access (Terminal)"
+  echo "  n      → View live network log"
+  echo "  b      → Manage domain block/allow lists"
+  echo "  R      → Toggle restricted network mode (press again for open)"
   echo "  d      → Delete"
   echo "  t      → Terminate (stop)"
   echo "  e      → Export to .tar.gz (pigz, multi-core)"
@@ -1213,6 +1703,33 @@ manage_codespaces_menu() {
           if ! is_running "${names[$idx]}"; then
             start_codespace "${names[$idx]}"
           fi
+        fi
+        ;;
+      netlog)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          view_network_log "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to view its network log first.${RESET}"
+          press_any_key
+        fi
+        ;;
+      domains)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          manage_domain_lists "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to manage its domain policy first.${RESET}"
+          press_any_key
+        fi
+        ;;
+      restrict)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          toggle_restricted_mode "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to toggle restricted mode first.${RESET}"
+          press_any_key
         fi
         ;;
       delete)
