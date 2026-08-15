@@ -148,7 +148,7 @@ arrow_menu() {
 
     echo
     echo -e "${YELLOW}↑/↓ move   Enter select   c cli   n netlog   b domains   R restrict${RESET}"
-    echo -e "${YELLOW}d delete   t terminate   e export   i import   q back${RESET}"
+    echo -e "${YELLOW}p proxy on/off   d delete   t terminate   e export   i import   q back${RESET}"
 
     key=$(read_key)
     case "$key" in
@@ -159,6 +159,7 @@ arrow_menu() {
       n|N)       ARROW_MENU_RESULT="netlog:$sel"; return 0 ;;
       b|B)       ARROW_MENU_RESULT="domains:$sel"; return 0 ;;
       r|R)       ARROW_MENU_RESULT="restrict:$sel"; return 0 ;;
+      p|P)       ARROW_MENU_RESULT="toggleproxy:$sel"; return 0 ;;
       d|D)       ARROW_MENU_RESULT="delete:$sel"; return 0 ;;
       t|T)       ARROW_MENU_RESULT="terminate:$sel"; return 0 ;;
       e|E)       ARROW_MENU_RESULT="export:$sel"; return 0 ;;
@@ -347,6 +348,17 @@ SUDOEOF
     for unit in systemd-resolved systemd-timesyncd systemd-networkd \
                 getty@tty1 remote-fs systemd-pstore; do
       ln -sf /dev/null "/etc/systemd/system/${unit}.service" 2>/dev/null || true
+    done
+
+    # ---------------------------------------------------------- #
+    # Force apt sources onto https instead of http. Ubuntu apt
+    # (1.5+/noble) has https support built in, no apt-transport-
+    # https package needed. Covers both classic sources.list and
+    # the deb822 *.sources files used on 24.04+.
+    # ---------------------------------------------------------- #
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+      [[ -f "$f" ]] || continue
+      sed -i -E "s#http://(archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com|old-releases\.ubuntu\.com|[a-z]{2}\.archive\.ubuntu\.com)#https://\1#g" "$f" 2>/dev/null || true
     done
   '
 }
@@ -591,6 +603,14 @@ device_ip() {
 # only; it does not decrypt TLS, so paths/bodies of HTTPS requests
 # are never inspected. Tools that ignore proxy env vars, or that talk
 # raw TCP/UDP/DNS-over-something-else, will bypass it.
+#
+# Both HTTP and HTTPS are handled the same way regardless of whether
+# the codespace's apt sources use http:// or https:// mirrors:
+#   - Plain HTTP requests are terminated and re-issued by the proxy
+#     (do_GET/do_POST/etc below), so they're logged with full
+#     method/host/port detail.
+#   - HTTPS requests arrive as a CONNECT tunnel and are relayed
+#     byte-for-byte without decryption, so only host:port is logged.
 # ================================================================== #
 ensure_proxy_script() {
   cat > "$NETPROXY_SCRIPT" << 'PYEOF'
@@ -805,6 +825,14 @@ ensure_network_files() {
   [[ -f "$META_DIR/$name.blocklist" ]] || : > "$META_DIR/$name.blocklist"
   [[ -f "$META_DIR/$name.allowlist" ]] || : > "$META_DIR/$name.allowlist"
   [[ -f "$META_DIR/$name.netlog" ]]    || : > "$META_DIR/$name.netlog"
+  [[ -f "$META_DIR/$name.proxyenabled" ]] || echo "on" > "$META_DIR/$name.proxyenabled"
+}
+
+is_proxy_enabled() {
+  local name="$1"
+  local state
+  state=$(cat "$META_DIR/$name.proxyenabled" 2>/dev/null || echo "on")
+  [[ "$state" == "on" ]]
 }
 
 is_proxy_running() {
@@ -823,6 +851,14 @@ is_proxy_running() {
 start_network_proxy() {
   local name="$1"
 
+  ensure_network_files "$name"
+
+  if ! is_proxy_enabled "$name"; then
+    # Proxy has been explicitly turned off for this codespace — leave
+    # traffic direct/unproxied and don't spin anything up.
+    return 1
+  fi
+
   if ! command -v python3 >/dev/null 2>&1; then
     echo -e "${YELLOW}[!] python3 not found on host — network logging/filtering disabled for '$name'.${RESET}"
     echo -e "${YELLOW}    Install it with: pkg install python -y${RESET}"
@@ -830,7 +866,6 @@ start_network_proxy() {
   fi
 
   ensure_proxy_script
-  ensure_network_files "$name"
 
   if is_proxy_running "$name"; then
     return 0
@@ -880,6 +915,43 @@ stop_network_proxy() {
   rm -f "$pidfile"
 }
 
+# ================================================================== #
+# toggle_proxy_enabled — fully turn the network proxy on/off for a
+# codespace. This is separate from restricted mode (R): restricted
+# mode still requires the proxy to be running (it enforces the allow/
+# deny policy). Turning the proxy off entirely means the codespace's
+# traffic goes direct, unlogged and unfiltered, until turned back on.
+# ================================================================== #
+toggle_proxy_enabled() {
+  local name="$1"
+  ensure_network_files "$name"
+  clear; banner
+  if is_proxy_enabled "$name"; then
+    echo "off" > "$META_DIR/$name.proxyenabled"
+    stop_network_proxy "$name"
+    rm -f "$CODESPACES_DIR/$name/etc/apt/apt.conf.d/95codespace-proxy" 2>/dev/null
+    echo -e "${RED}Network proxy for '$name' turned OFF.${RESET}"
+    echo -e "${YELLOW}Traffic will go direct (unlogged, unfiltered) until you turn it back on.${RESET}"
+    if is_running "$name"; then
+      echo -e "${YELLOW}Note: it's already started with the old proxy env baked into its shell.${RESET}"
+      echo -e "${YELLOW}Restart the codespace (t then Enter) for this to fully take effect.${RESET}"
+    fi
+  else
+    echo "on" > "$META_DIR/$name.proxyenabled"
+    echo -e "${GREEN}Network proxy for '$name' turned ON.${RESET}"
+    if is_running "$name"; then
+      start_network_proxy "$name"
+      local proxy_port=""
+      [[ -f "$META_DIR/$name.proxyport" ]] && proxy_port=$(cat "$META_DIR/$name.proxyport")
+      write_apt_proxy_conf "$CODESPACES_DIR/$name" "$proxy_port" "on"
+      echo -e "${YELLOW}Note: an already-running codespace shell won't pick up the new"
+      echo -e "http_proxy/https_proxy env vars automatically. Restart it (t then Enter)"
+      echo -e "or export them manually inside the CLI to route existing sessions.${RESET}"
+    fi
+  fi
+  press_any_key
+}
+
 view_network_log() {
   local name="$1"
   ensure_network_files "$name"
@@ -887,7 +959,9 @@ view_network_log() {
   echo -e "${BOLD}Network log: $name${RESET}"
   local mode
   mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
-  if is_proxy_running "$name"; then
+  if ! is_proxy_enabled "$name"; then
+    echo -e "  Proxy:  ${RED}disabled${RESET} (turned off with 'p' — traffic is direct/unlogged)"
+  elif is_proxy_running "$name"; then
     echo -e "  Proxy:  ${GREEN}running${RESET} on 127.0.0.1:$(cat "$META_DIR/$name.proxyport" 2>/dev/null)"
   else
     echo -e "  Proxy:  ${RED}not running${RESET} (starts the codespace to enable logging)"
@@ -1010,6 +1084,43 @@ fix_rootfs_permissions() {
 }
 
 # ================================================================== #
+# force_https_apt_sources — rewrite a cloned codespace's apt sources
+# to use https:// instead of http:// for the standard Ubuntu mirrors.
+# Operates directly on the host-side rootfs path (no chroot needed).
+# ================================================================== #
+force_https_apt_sources() {
+  local rootfs="$1"
+  local f
+  for f in "$rootfs"/etc/apt/sources.list "$rootfs"/etc/apt/sources.list.d/*.list "$rootfs"/etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    sed -i -E "s#http://(archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com|old-releases\.ubuntu\.com|[a-z]{2}\.archive\.ubuntu\.com)#https://\1#g" "$f" 2>/dev/null || true
+  done
+}
+
+# ================================================================== #
+# write_apt_proxy_conf — point apt's Acquire::http/https::Proxy at
+# the codespace's local logging proxy, so `apt update`/`apt install`
+# traffic (both http:// and https:// sources) is captured the same
+# way any other in-container HTTP(S) traffic is. Written/removed on
+# every start so it always matches the current proxy on/off state.
+# ================================================================== #
+write_apt_proxy_conf() {
+  local rootfs="$1" proxy_port="$2" enabled="$3"
+  local conf_dir="$rootfs/etc/apt/apt.conf.d"
+  mkdir -p "$conf_dir" 2>/dev/null
+  if [[ "$enabled" == "on" && -n "$proxy_port" ]]; then
+    cat > "$conf_dir/95codespace-proxy" <<CONF
+// Managed by Termux CodeSpace — routes apt's HTTP and HTTPS
+// acquisition through the per-codespace logging/filtering proxy.
+Acquire::http::Proxy "http://127.0.0.1:${proxy_port}";
+Acquire::https::Proxy "http://127.0.0.1:${proxy_port}";
+CONF
+  else
+    rm -f "$conf_dir/95codespace-proxy" 2>/dev/null
+  fi
+}
+
+# ================================================================== #
 # prepare_codespace_rootfs — create required directories + safety
 # ================================================================== #
 prepare_codespace_rootfs() {
@@ -1053,6 +1164,8 @@ exec "$@"
 SUDOEOF
     chmod +x "$rootfs/usr/local/bin/sudo"
   fi
+
+  force_https_apt_sources "$rootfs"
 }
 
 # ================================================================== #
@@ -1365,6 +1478,7 @@ create_codespace() {
   fix_l2s_symlinks "$BASE_ROOTFS" "$CODESPACES_DIR/$name"
   prepare_codespace_rootfs "$CODESPACES_DIR/$name"
   write_codeserver_settings "$CODESPACES_DIR/$name"
+  ensure_network_files "$name"
 
   local port
   port=$(find_free_port "$req_port")
@@ -1415,11 +1529,15 @@ start_codespace() {
 
     prepare_codespace_rootfs "$rootfs"
     write_codeserver_settings "$rootfs"
+    ensure_network_files "$name"
 
     start_network_proxy "$name"
     local proxy_port="" proxy_env=""
     [[ -f "$META_DIR/$name.proxyport" ]] && proxy_port=$(cat "$META_DIR/$name.proxyport")
-    if is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+
+    if is_proxy_enabled "$name" && is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+      # Both HTTP and HTTPS traffic route through the same local proxy:
+      # plain HTTP is terminated/re-issued, HTTPS is CONNECT-tunnelled.
       proxy_env="
 export http_proxy=\"http://127.0.0.1:${proxy_port}\"
 export https_proxy=\"http://127.0.0.1:${proxy_port}\"
@@ -1427,6 +1545,9 @@ export HTTP_PROXY=\"http://127.0.0.1:${proxy_port}\"
 export HTTPS_PROXY=\"http://127.0.0.1:${proxy_port}\"
 export no_proxy=\"localhost,127.0.0.1\"
 export NO_PROXY=\"localhost,127.0.0.1\""
+      write_apt_proxy_conf "$rootfs" "$proxy_port" "on"
+    else
+      write_apt_proxy_conf "$rootfs" "" "off"
     fi
 
     local launcher="$META_DIR/$name.launcher.sh"
@@ -1558,9 +1679,16 @@ cli_codespace() {
   sleep 1
 
   prepare_codespace_rootfs "$rootfs"
+  ensure_network_files "$name"
   start_network_proxy "$name"
   local proxy_port=""
   [[ -f "$META_DIR/$name.proxyport" ]] && proxy_port=$(cat "$META_DIR/$name.proxyport")
+
+  if is_proxy_enabled "$name" && is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+    write_apt_proxy_conf "$rootfs" "$proxy_port" "on"
+  else
+    write_apt_proxy_conf "$rootfs" "" "off"
+  fi
 
   # Use a subshell to isolate environment variable modifications
   (
@@ -1577,7 +1705,7 @@ cli_codespace() {
     export PULSE_SERVER=127.0.0.1
     export PROOT_L2S_DIR="$rootfs/.l2s"
 
-    if is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
+    if is_proxy_enabled "$name" && is_proxy_running "$name" && [[ -n "$proxy_port" ]]; then
       export http_proxy="http://127.0.0.1:${proxy_port}"
       export https_proxy="http://127.0.0.1:${proxy_port}"
       export HTTP_PROXY="http://127.0.0.1:${proxy_port}"
@@ -1633,10 +1761,12 @@ show_codespace_info() {
   local netmode
   netmode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
   echo -e "${BOLD}Network${RESET}"
-  if is_proxy_running "$name"; then
-    echo -e "  Proxy:    ${GREEN}running${RESET} on 127.0.0.1:$(cat "$META_DIR/$name.proxyport" 2>/dev/null)"
+  if ! is_proxy_enabled "$name"; then
+    echo -e "  Proxy:    ${RED}disabled${RESET} (all traffic direct, unlogged)"
+  elif is_proxy_running "$name"; then
+    echo -e "  Proxy:    ${GREEN}running${RESET} on 127.0.0.1:$(cat "$META_DIR/$name.proxyport" 2>/dev/null) (HTTP + HTTPS)"
   else
-    echo -e "  Proxy:    ${YELLOW}not running${RESET} (starts with the codespace)"
+    echo -e "  Proxy:    ${YELLOW}enabled, not running${RESET} (starts with the codespace)"
   fi
   if [[ "$netmode" == "restricted" ]]; then
     echo -e "  Mode:     ${RED}restricted${RESET}"
@@ -1652,6 +1782,7 @@ show_codespace_info() {
   echo "  n      → View live network log"
   echo "  b      → Manage domain block/allow lists"
   echo "  R      → Toggle restricted network mode (press again for open)"
+  echo "  p      → Turn the network proxy fully on/off"
   echo "  d      → Delete"
   echo "  t      → Terminate (stop)"
   echo "  e      → Export to .tar.gz (pigz, multi-core)"
@@ -1729,6 +1860,15 @@ manage_codespaces_menu() {
         else
           clear; banner
           echo -e "${YELLOW}Select an existing codespace to toggle restricted mode first.${RESET}"
+          press_any_key
+        fi
+        ;;
+      toggleproxy)
+        if [[ $idx -lt ${#names[@]} ]]; then
+          toggle_proxy_enabled "${names[$idx]}"
+        else
+          clear; banner
+          echo -e "${YELLOW}Select an existing codespace to toggle its proxy first.${RESET}"
           press_any_key
         fi
         ;;
