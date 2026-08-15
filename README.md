@@ -16,7 +16,7 @@
 
 TermuxCodeSpace is a single-file Bash script that lets you create **multiple isolated Ubuntu environments** on Android through Termux.
 
-Each codespace runs its own [code-server](https://github.com/coder/code-server) instance, so you get VS Code in the browser with separate ports, separate configs, and separate filesystem clones. Each codespace also gets its own lightweight network proxy, so you can see what it's talking to and, if you want, restrict it.
+Each codespace runs its own [code-server](https://github.com/coder/code-server) instance, so you get VS Code in the browser with separate ports, separate configs, and separate filesystem clones. Each codespace also gets its own lightweight network proxy, so you can see what it's talking to and, if you want, restrict it — or turn the proxy off entirely and run direct.
 
 Think of it as **local Codespaces on your phone**.
 
@@ -46,7 +46,7 @@ It is useful because:
 * you can test different setups without breaking anything else
 * it runs directly on your phone with Termux
 * it is lightweight, portable, and easy to launch anywhere
-* you can watch, and optionally restrict, what each codespace talks to on the network
+* you can watch, and optionally restrict, what each codespace talks to on the network — or switch that off entirely per codespace
 
 ## Features
 
@@ -57,9 +57,11 @@ It is useful because:
 * Arrow-key menu interface
 * Background execution with `nohup`
 * Create, start, stop, delete, and terminate all codespaces
-* Per-codespace network activity log
+* Per-codespace network activity log, covering both HTTP and HTTPS traffic
 * Per-codespace domain block/allow list
 * Per-codespace "restricted" (default-deny) network mode toggle
+* Per-codespace proxy on/off switch — turn logging/filtering off for direct, unproxied traffic when you don't need it
+* `apt` traffic (both the base image and every cloned codespace) is routed through the local proxy and forced onto `https://` mirrors instead of `http://`
 
 ## Requirements
 
@@ -93,9 +95,10 @@ Start the tool with:
 On first run, the script will:
 
 1. Install a base Ubuntu image with `proot-distro`
-2. Set up the required packages
-3. Install `code-server`
-4. Prepare the base environment for cloning
+2. Rewrite its `apt` sources to use `https://` mirrors instead of `http://`
+3. Set up the required packages
+4. Install `code-server`
+5. Prepare the base environment for cloning
 
 After that, new codespaces are created much faster because they are cloned from the base Ubuntu rootfs.
 
@@ -119,26 +122,27 @@ Example codespace list:
 
 ### Controls
 
-| Key       | Action                                             |
-| --------- | --------------------------------------------------- |
-| `↑` / `↓` | Navigate                                            |
-| `Enter`   | Select or start a codespace                         |
-| `c`       | Connect to codespace shell                          |
-| `n`       | View live network activity log                      |
-| `b`       | Manage domain block/allow lists                     |
-| `R`       | Toggle restricted network mode (press again for open)|
-| `d`       | Delete a codespace                                  |
-| `t`       | Stop a codespace                                    |
-| `q`       | Go back                                             |
-| `i`       | Import codespace                                    |
-| `e`       | Export codespace                                    |
+| Key       | Action                                                |
+| --------- | ------------------------------------------------------ |
+| `↑` / `↓` | Navigate                                                |
+| `Enter`   | Select or start a codespace                             |
+| `c`       | Connect to codespace shell                              |
+| `n`       | View live network activity log                          |
+| `b`       | Manage domain block/allow lists                         |
+| `R`       | Toggle restricted network mode (press again for open)    |
+| `p`       | Turn the network proxy fully on/off for that codespace   |
+| `d`       | Delete a codespace                                       |
+| `t`       | Stop a codespace                                         |
+| `q`       | Go back                                                  |
+| `i`       | Import codespace                                         |
+| `e`       | Export codespace                                         |
 
 When creating a codespace, you will be asked for:
 
 * **Name** — use letters, numbers, hyphens, or underscores
 * **Port** — leave blank for automatic assignment, or enter your own
 
-The script generates a unique password, writes the `code-server` config, and starts the server automatically. It also starts that codespace's network proxy, so logging is active as soon as the codespace is up.
+The script generates a unique password, writes the `code-server` config, and starts the server automatically. It also starts that codespace's network proxy (unless you've turned it off with `p`), so logging is active as soon as the codespace is up.
 
 ## Direct Shell Access
 
@@ -168,7 +172,7 @@ or press **Ctrl+D**.
 
 You will automatically return to the TermuxCodeSpace manager.
 
-This provides a lightweight workflow for package management, Git operations, compiling code, and other terminal-based tasks without requiring a browser or large display. CLI sessions go through the same network proxy as code-server, so anything you `curl`, `git clone`, or `pip install` here shows up in the network log too.
+This provides a lightweight workflow for package management, Git operations, compiling code, and other terminal-based tasks without requiring a browser or large display. CLI sessions go through the same network proxy as code-server (when the proxy is enabled), so anything you `curl`, `git clone`, `apt install`, or `pip install` here shows up in the network log too.
 
 ## Accessing code-server
 
@@ -195,12 +199,12 @@ Passwords are also stored in:
 
 ## Network Logging & Filtering
 
-Every codespace has its own forward proxy that starts and stops alongside it. The launcher points the container's `http_proxy` / `https_proxy` at it, so both code-server and `c` shell sessions route through it automatically — nothing to configure per-tool.
+Every codespace has its own forward proxy that starts and stops alongside it. The launcher points the container's `http_proxy` / `https_proxy` at it, so code-server, `c` shell sessions, and `apt` all route through it automatically — nothing to configure per-tool.
 
 ```text
 ┌──────────────┐   http_proxy   ┌─────────────────┐        ┌────────────┐
-│  codespace    │──────────────▶│  per-codespace    │───────▶│  internet  │
-│  (proot)      │                │  proxy (Termux,   │        │            │
+│  codespace    │   https_proxy  │  per-codespace    │───────▶│  internet  │
+│  (proot)      │───────────────▶│  proxy (Termux,   │        │            │
 │               │◀──────────────│  no root)         │◀───────│            │
 └──────────────┘                └─────────────────┘        └────────────┘
                                         │
@@ -211,14 +215,17 @@ Every codespace has its own forward proxy that starts and stops alongside it. Th
 
 **What it can do:**
 
-* Log every request: timestamp, allow/deny verdict, method, host, port
+* Log every request: timestamp, allow/deny verdict, method, host, port — for both plain HTTP and HTTPS (`CONNECT`)
 * Block or unblock individual domains (`b` menu)
 * Flip a codespace into "restricted" mode (`R`) — default-deny, only domains you've explicitly allowed can be reached; press `R` again to go back to open
+* Turn the proxy off entirely (`p`) for a codespace that needs to run fully direct — no logging, no filtering, until you switch it back on
+* Route `apt update` / `apt install` through the same proxy as everything else, via an `Acquire::http::Proxy` / `Acquire::https::Proxy` config written into the codespace automatically
+* Rewrite that codespace's `apt` sources to use `https://` mirrors instead of `http://`, so package downloads are encrypted end-to-end and not just tunnelled in the clear to the proxy
 
 **What it can't do (by design):**
 
 * It's a domain-level filter, not deep packet inspection. HTTPS is tunnelled via `CONNECT` and never decrypted, so only the hostname is ever visible — not the path, headers, or body.
-* It only sees traffic that respects the `http_proxy` / `https_proxy` environment variables. A process using raw sockets, a custom DNS resolver, or hardcoded IPs can bypass it.
+* It only sees traffic that respects the `http_proxy` / `https_proxy` environment variables (or, for `apt`, its own `Acquire::*::Proxy` settings). A process using raw sockets, a custom DNS resolver, or hardcoded IPs can bypass it.
 * It runs as a normal, unprivileged process on the Termux host — no `iptables`, no root, no network namespace tricks. That's intentional (keeps the whole setup rootless), but it's a cooperative proxy, not a transparent firewall.
 
 ### Viewing the log
@@ -232,8 +239,11 @@ Network log: myproject
 
 [2026-08-12 10:14:02] ALLOW CONNECT   github.com:443
 [2026-08-12 10:14:03] ALLOW GET      raw.githubusercontent.com:443
+[2026-08-12 10:14:04] ALLOW CONNECT   archive.ubuntu.com:443
 [2026-08-12 10:14:11] DENY  CONNECT   ads.example.com:443
 ```
+
+If the proxy has been turned off for that codespace (`p`), this screen shows `Proxy: disabled` instead, and the log simply won't be receiving new entries.
 
 Press `Ctrl+C` to return to the menu.
 
@@ -260,10 +270,33 @@ q) back
 * The blocklist is always enforced, in both open and restricted mode.
 * The allowlist only matters once restricted mode is on.
 * Changes apply immediately — no restart needed.
+* This policy only has anything to enforce while the proxy itself is on (`p`); with the proxy off, traffic goes direct and bypasses block/allow lists entirely.
 
 ### Restricted mode
 
 Press `R` on a codespace to flip it into restricted (default-deny) mode. Only domains on its allowlist will be reachable; everything else gets a `403` from the proxy. Press `R` again to go back to open mode (blocklist-only).
+
+### Turning the proxy on/off
+
+Press `p` on a codespace to turn its network proxy fully off, or back on:
+
+```text
+Network proxy for 'myproject' turned OFF.
+Traffic will go direct (unlogged, unfiltered) until you turn it back on.
+```
+
+A few things worth knowing:
+
+* This is separate from restricted mode (`R`). Restricted mode still needs the proxy running to enforce its policy — turning the proxy off with `p` bypasses logging *and* filtering entirely, regardless of `R`.
+* If the codespace is currently running, toggling `p` won't rewire an already-open shell or code-server session — the script will tell you to restart it (`t`, then start it again) for the change to fully apply.
+* The state is remembered per codespace (`~/.termux-codespace/meta/<name>.proxyenabled`), so it persists across restarts until you toggle it again.
+
+### `apt` and HTTPS
+
+Two things happen automatically so `apt` behaves consistently with everything else in a codespace:
+
+1. **Sources are rewritten to `https://`.** The standard Ubuntu mirrors (`archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com`, and the country-code mirrors like `us.archive.ubuntu.com`) are switched from `http://` to `https://` in both the classic `sources.list` and the newer deb822 `*.sources` format. This happens once on the base image and again on every codespace clone, so it applies even if you import an older codespace.
+2. **`apt` is pointed at the local proxy.** As long as the codespace's proxy is on (`p`), an `Acquire::http::Proxy` / `Acquire::https::Proxy` config is written into `/etc/apt/apt.conf.d/95codespace-proxy` so `apt update` / `apt install` traffic shows up in the network log the same way `curl` or `git` traffic does. Turning the proxy off removes this file again, and `apt` falls back to a direct HTTPS connection.
 
 ## How It Works
 
@@ -272,7 +305,7 @@ First run:
   proot-distro install ubuntu
         │
         ▼
-  Base Ubuntu rootfs
+  Base Ubuntu rootfs, apt sources switched to https://
   ($PREFIX/var/lib/proot-distro/containers/ubuntu/rootfs)
         │
         │  cp -a
@@ -282,12 +315,12 @@ First run:
     ├── project-b/
     └── project-c/
         │
-        │  proot --rootfs=<clone> ...  (http_proxy → 127.0.0.1:<proxy-port>)
+        │  proot --rootfs=<clone> ...  (http_proxy/https_proxy → 127.0.0.1:<proxy-port>, if enabled)
         ▼
   code-server on port 2000, 2001, 2002 ...
 ```
 
-Each codespace is a full independent Ubuntu filesystem. Changes made in one environment do not affect the others. Each codespace's network proxy, log, and domain policy are likewise independent.
+Each codespace is a full independent Ubuntu filesystem. Changes made in one environment do not affect the others. Each codespace's network proxy, log, domain policy, and proxy on/off state are likewise independent.
 
 ## File Structure
 
@@ -298,6 +331,11 @@ Each codespace is a full independent Ubuntu filesystem. Changes made in one envi
 │   ├── myproject/
 │   │   ├── bin/
 │   │   ├── usr/
+│   │   ├── etc/
+│   │   │   └── apt/
+│   │   │       ├── sources.list          (rewritten to https://)
+│   │   │       └── apt.conf.d/
+│   │   │           └── 95codespace-proxy (present only while the proxy is on)
 │   │   ├── root/
 │   │   │   └── .config/code-server/config.yaml
 │   │   ├── .l2s/
@@ -310,6 +348,7 @@ Each codespace is a full independent Ubuntu filesystem. Changes made in one envi
     ├── myproject.log
     ├── myproject.launcher.sh
     ├── myproject.proxyport
+    ├── myproject.proxyenabled
     ├── myproject.proxy.pid
     ├── myproject.proxy.log
     ├── myproject.netlog
@@ -361,13 +400,18 @@ bash ~/.termux-codespace/meta/<name>.launcher.sh
 
 ### Network log is empty / requests aren't showing up
 
+* Check whether the proxy is turned on for that codespace: on the codespace info screen, `Proxy:` should say `running`, not `disabled`. If it says `disabled`, press `p` to turn it back on.
 * Check `python3` is installed on the **Termux host** (not inside the codespace): `command -v python3`. Without it the proxy is skipped entirely and the codespace runs with unfiltered, unlogged networking.
 * Check the proxy actually started: `cat ~/.termux-codespace/meta/<name>.proxy.log`
 * Some tools ignore `http_proxy`/`https_proxy` (see [Network Logging & Filtering](#network-logging--filtering)) — those requests won't appear.
 
 ### A codespace can't reach anything after enabling restricted mode
 
-That's expected — restricted mode is default-deny. Press `b` on that codespace and add the domains it needs (e.g. `.githubusercontent.com`, `pypi.org`, `.npmjs.org`) to its allowlist, or press `R` again to go back to open mode.
+That's expected — restricted mode is default-deny. Press `b` on that codespace and add the domains it needs (e.g. `.githubusercontent.com`, `pypi.org`, `.npmjs.org`, `archive.ubuntu.com`, `security.ubuntu.com`) to its allowlist, or press `R` again to go back to open mode.
+
+### `apt update` fails or times out after turning the proxy on/off
+
+If you toggled `p` while the codespace was already running, its current shell or code-server session is still using the old environment. Stop the codespace (`t`) and start it again — the launcher regenerates the `http_proxy`/`https_proxy` exports and the `apt` proxy config from the current state each time it starts.
 
 ### Reset everything
 
