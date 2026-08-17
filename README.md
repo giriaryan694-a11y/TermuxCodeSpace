@@ -57,6 +57,9 @@ It is useful because:
 * Arrow-key menu interface
 * Background execution with `nohup`
 * Create, start, stop, delete, and terminate all codespaces
+* Recovery file manager for quota-exceeded codespaces (delete-only)
+* Parallel filesystem scanning with file/directory sizes and permissions
+* Recursive directory size calculation with a PHP fallback when the Python scanner is unavailable
 * Per-codespace network activity log, covering both HTTP and HTTPS traffic
 * Per-codespace domain block/allow list
 * Per-codespace "restricted" (default-deny) network mode toggle
@@ -105,9 +108,9 @@ After that, new codespaces are created much faster because they are cloned from 
 ## Main Menu
 
 ```text
-➤ Manage Codespaces
-➤ Terminate All
-➤ Exit
+> Manage Codespaces
+> Terminate All
+> Exit
 ```
 
 ## Creating and Managing Codespaces
@@ -115,7 +118,7 @@ After that, new codespaces are created much faster because they are cloned from 
 Example codespace list:
 
 ```text
-➤ myproject    [running]
+> myproject    [running]
   backend-api   [stopped]
   + Create New Codespace
 ```
@@ -124,7 +127,7 @@ Example codespace list:
 
 | Key       | Action                                                |
 | --------- | ------------------------------------------------------ |
-| `↑` / `↓` | Navigate                                                |
+| `UP` / `DOWN` | Navigate                                                |
 | `Enter`   | Select or start a codespace                             |
 | `c`       | Connect to codespace shell                              |
 | `n`       | View live network activity log                          |
@@ -143,6 +146,35 @@ When creating a codespace, you will be asked for:
 * **Port** — leave blank for automatic assignment, or enter your own
 
 The script generates a unique password, writes the `code-server` config, and starts the server automatically. It also starts that codespace's network proxy (unless you've turned it off with `p`), so logging is active as soon as the codespace is up.
+
+## Recovery File Manager
+
+If a codespace is stopped because it exceeds its storage quota, TermuxCodeSpace can launch a **delete-only recovery file manager** so you can free storage without starting the full codespace.
+
+The recovery manager provides:
+
+* Browse the codespace filesystem
+* File sizes and recursive directory sizes
+* Full symbolic permissions such as `drwxr-xr-x`
+* Octal permissions such as `0755`
+* Modification timestamps
+* Delete files or directories
+* Parallel filesystem scanning for faster browsing
+* A PHP filesystem fallback if the Python scanner cannot be executed
+* No file creation, uploads, edits, or renames
+
+The recovery manager is intentionally restricted to deletion so it can be used to recover space safely after a quota stop.
+
+Example:
+
+```text
+Recovery File Manager for 'myproject' is up.
+  This codespace exceeded its storage quota and was stopped.
+  Browse to it to delete files and free up space:
+  Local:    http://127.0.0.1:2000
+  Password: same as the code-server password for this codespace
+  Delete-only - no create, write, or upload.
+```
 
 ## Direct Shell Access
 
