@@ -2705,8 +2705,20 @@ show_codespace_info() {
     echo -e "  Port: ${port:-?}  Pass: ${pass:-?}"
     is_running "$name" && echo -e "  Status: ${GREEN}RUNNING${RESET}" || echo -e "  Status: ${RED}STOPPED${RESET}"
     echo -e "  Storage: $(format_quota_usage "$name")"
+    local quota_mb used_mb over_quota=0
+    quota_mb=$(get_quota_mb "$name")
+    if [[ "$quota_mb" -gt 0 ]]; then
+        used_mb=$(get_codespace_size_mb "$name")
+        [[ -n "$used_mb" && "$used_mb" -gt "$quota_mb" ]] && over_quota=1
+    fi
     if is_filemanager_running "$name"; then
-        echo -e "  File Manager: ${GREEN}RUNNING${RESET} (over quota recovery mode - http://127.0.0.1:${port:-?})"
+        echo -e "  File Manager: ${GREEN}RUNNING${RESET} (recovery mode - http://127.0.0.1:${port:-?})"
+    elif [[ "$over_quota" -eq 1 ]]; then
+        if command -v php >/dev/null 2>&1; then
+            echo -e "  File Manager: ${RED}NOT RUNNING${RESET} (over quota, but it failed to start - check $META_DIR/$name.fm.log)"
+        else
+            echo -e "  File Manager: ${RED}NOT RUNNING${RESET} (over quota, but 'php' is not installed - run: pkg install php)"
+        fi
     fi
     echo -e "  Proxy:   $(proxy_status_colored "$name")"
     mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
