@@ -70,7 +70,7 @@ EOF
 press_any_key() {
     echo
     local _junk
-    while read -r -t 0 -n 1 _junk 2>/dev/null; do :; done
+    while IFS= read -r -t 0.01 -n 1 _junk 2>/dev/null; do :; done
     read -n1 -rsp "Press any key to continue..."
     echo
 }
@@ -1333,7 +1333,7 @@ stop_network_proxy() {
 FILEMANAGER_SCRIPT="$BASE_DIR/filemanager.php"
 
 ensure_filemanager_script() {
-    local marker="$BASE_DIR/.filemanager_v5"
+    local marker="$BASE_DIR/.filemanager_v6"
 
     if [[ -f "$FILEMANAGER_SCRIPT" && -f "$marker" ]]; then
         return 0
@@ -1650,38 +1650,69 @@ function del_tree($path) {
     return true;
 }
 
-function shell_exec_available() {
-    static $ok = null;
+function php_function_disabled($name) {
+    static $disabled = null;
 
-    if ($ok !== null) {
-        return $ok;
+    if ($disabled === null) {
+        $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
     }
 
-    if (!function_exists('shell_exec')) {
-        return $ok = false;
+    return !function_exists($name) || in_array($name, $disabled, true);
+}
+
+function shell_run($cmd) {
+    if (!php_function_disabled('shell_exec')) {
+        $out = @shell_exec($cmd);
+        if ($out !== null && $out !== false) {
+            return $out;
+        }
     }
 
-    $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
-
-    if (in_array('shell_exec', $disabled, true)) {
-        return $ok = false;
+    if (!php_function_disabled('exec')) {
+        $lines = [];
+        @exec($cmd, $lines);
+        if ($lines) {
+            return implode("\n", $lines) . "\n";
+        }
     }
 
-    return $ok = true;
+    if (!php_function_disabled('popen')) {
+        $fp = @popen($cmd, 'r');
+        if ($fp) {
+            $data = stream_get_contents($fp);
+            pclose($fp);
+            if ($data !== false && $data !== '') {
+                return $data;
+            }
+        }
+    }
+
+    if (!php_function_disabled('proc_open')) {
+        $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $pipes = [];
+        $proc = @proc_open($cmd, $descriptors, $pipes);
+        if (is_resource($proc)) {
+            $data = stream_get_contents($pipes[1]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_close($proc);
+            if ($data !== false && $data !== '') {
+                return $data;
+            }
+        }
+    }
+
+    return null;
 }
 
 function dir_sizes_via_du($dir) {
-    if (!shell_exec_available()) {
-        return null;
-    }
-
     $escaped = escapeshellarg($dir);
-    $timeoutBin = trim((string)@shell_exec('command -v timeout 2>/dev/null'));
-    $cmd = ($timeoutBin !== '')
+    $timeoutOut = shell_run('command -v timeout 2>/dev/null');
+    $cmd = (trim((string)$timeoutOut) !== '')
         ? "timeout 12 du -sb --max-depth=1 $escaped 2>/dev/null"
         : "du -sb --max-depth=1 $escaped 2>/dev/null";
 
-    $out = @shell_exec($cmd);
+    $out = shell_run($cmd);
 
     if ($out === null || trim($out) === '') {
         return null;
@@ -1703,7 +1734,54 @@ function dir_sizes_via_du($dir) {
         $sizes[$parts[1]] = (int)$parts[0];
     }
 
-    return $sizes;
+    return $sizes ?: null;
+}
+
+function dir_size_native($dir, $deadline) {
+    $total = 0;
+    $stack = [$dir];
+    $timedOut = false;
+
+    while ($stack) {
+        $current = array_pop($stack);
+        $items = @scandir($current, SCANDIR_SORT_NONE);
+
+        if ($items === false) {
+            continue;
+        }
+
+        foreach ($items as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+
+            $path = $current . '/' . $name;
+            $st = @lstat($path);
+
+            if ($st === false) {
+                continue;
+            }
+
+            $mode = $st['mode'] & 0170000;
+
+            if ($mode === 0120000) {
+                continue;
+            }
+
+            if ($mode === 0040000) {
+                $stack[] = $path;
+            } else {
+                $total += (int)($st['size'] ?? 0);
+            }
+        }
+
+        if (microtime(true) > $deadline) {
+            $timedOut = true;
+            break;
+        }
+    }
+
+    return [$total, $timedOut];
 }
 
 function scan_fast($dir, $rel) {
@@ -1714,6 +1792,7 @@ function scan_fast($dir, $rel) {
     }
 
     $dirSizes = dir_sizes_via_du($dir);
+    $nativeDeadline = microtime(true) + 8;
 
     $out = [];
 
@@ -1746,9 +1825,16 @@ function scan_fast($dir, $rel) {
         $isDir = (!$isLink && $mode === 0040000);
 
         if ($isDir) {
-            $size = ($dirSizes !== null && isset($dirSizes[$path])) ? $dirSizes[$path] : null;
-            $sizeHuman = ($size === null) ? '—' : human_size($size);
-            $size = $size ?? 0;
+            if ($dirSizes !== null && isset($dirSizes[$path])) {
+                $size = $dirSizes[$path];
+                $sizeHuman = human_size($size);
+            } elseif ($dirSizes === null && microtime(true) < $nativeDeadline) {
+                list($size, $timedOut) = dir_size_native($path, $nativeDeadline);
+                $sizeHuman = human_size($size) . ($timedOut ? '+' : '');
+            } else {
+                $size = 0;
+                $sizeHuman = '—';
+            }
         } else {
             $size = (int)($st['size'] ?? 0);
             $sizeHuman = human_size($size);
@@ -1767,6 +1853,7 @@ function scan_fast($dir, $rel) {
 
     return $out;
 }
+
 
 
 
@@ -2109,7 +2196,7 @@ FM_PHPEOF
 
     chmod 644 "$FILEMANAGER_SCRIPT" 2>/dev/null || true
 
-    rm -f "$BASE_DIR/.filemanager_v4" 2>/dev/null || true
+    rm -f "$BASE_DIR/.filemanager_v5" 2>/dev/null || true
     touch "$marker" 2>/dev/null || true
 }
 
@@ -2608,19 +2695,12 @@ LAUNCHER_EOF
     fi
     [[ "$quiet" == "--quiet" ]] && return 0
 
-    local ip domains; ip=$(device_ip)
+    local ip; ip=$(device_ip)
     echo -e "${GREEN}${BOLD}Codespace '$name' is up.${RESET}"
     echo -e "  Local:    http://127.0.0.1:${port}"
     [[ -n "$ip" ]] && echo -e "  Network:  http://${ip}:${port}"
     echo -e "  Password: ${BOLD}${pass}${RESET}"
     echo -e "  Proxy:    $(proxy_status_colored "$name")"
-    domains=$(recent_domains "$name" 15)
-    if [[ -n "$domains" ]]; then
-        echo -e "  Domains seen (HTTP + HTTPS):"
-        while IFS= read -r domain; do [[ -n "$domain" ]] && echo -e "    ${CYAN}- $domain${RESET}"; done <<< "$domains"
-    else
-        echo -e "  Domains seen (HTTP + HTTPS): ${YELLOW}none yet${RESET}"
-    fi
     press_any_key
 }
 
