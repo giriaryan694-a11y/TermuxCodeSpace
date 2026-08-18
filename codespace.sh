@@ -1333,7 +1333,7 @@ stop_network_proxy() {
 FILEMANAGER_SCRIPT="$BASE_DIR/filemanager.php"
 
 ensure_filemanager_script() {
-    local marker="$BASE_DIR/.filemanager_v4"
+    local marker="$BASE_DIR/.filemanager_v5"
 
     if [[ -f "$FILEMANAGER_SCRIPT" && -f "$marker" ]]; then
         return 0
@@ -1650,12 +1650,70 @@ function del_tree($path) {
     return true;
 }
 
+function shell_exec_available() {
+    static $ok = null;
+
+    if ($ok !== null) {
+        return $ok;
+    }
+
+    if (!function_exists('shell_exec')) {
+        return $ok = false;
+    }
+
+    $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+
+    if (in_array('shell_exec', $disabled, true)) {
+        return $ok = false;
+    }
+
+    return $ok = true;
+}
+
+function dir_sizes_via_du($dir) {
+    if (!shell_exec_available()) {
+        return null;
+    }
+
+    $escaped = escapeshellarg($dir);
+    $timeoutBin = trim((string)@shell_exec('command -v timeout 2>/dev/null'));
+    $cmd = ($timeoutBin !== '')
+        ? "timeout 12 du -sb --max-depth=1 $escaped 2>/dev/null"
+        : "du -sb --max-depth=1 $escaped 2>/dev/null";
+
+    $out = @shell_exec($cmd);
+
+    if ($out === null || trim($out) === '') {
+        return null;
+    }
+
+    $sizes = [];
+
+    foreach (explode("\n", trim($out)) as $line) {
+        if ($line === '') {
+            continue;
+        }
+
+        $parts = preg_split('/\s+/', $line, 2);
+
+        if (count($parts) < 2 || !ctype_digit($parts[0])) {
+            continue;
+        }
+
+        $sizes[$parts[1]] = (int)$parts[0];
+    }
+
+    return $sizes;
+}
+
 function scan_fast($dir, $rel) {
     $items = @scandir($dir, SCANDIR_SORT_NONE);
 
     if ($items === false) {
         return [];
     }
+
+    $dirSizes = dir_sizes_via_du($dir);
 
     $out = [];
 
@@ -1687,8 +1745,14 @@ function scan_fast($dir, $rel) {
         $isLink = ($mode === 0120000);
         $isDir = (!$isLink && $mode === 0040000);
 
-        $size = $isDir ? 0 : (int)($st['size'] ?? 0);
-        $sizeHuman = $isDir ? '—' : human_size($size);
+        if ($isDir) {
+            $size = ($dirSizes !== null && isset($dirSizes[$path])) ? $dirSizes[$path] : null;
+            $sizeHuman = ($size === null) ? '—' : human_size($size);
+            $size = $size ?? 0;
+        } else {
+            $size = (int)($st['size'] ?? 0);
+            $sizeHuman = human_size($size);
+        }
 
         $out[] = [
             'name' => $name,
@@ -1703,6 +1767,8 @@ function scan_fast($dir, $rel) {
 
     return $out;
 }
+
+
 
 if (!isset($_SESSION['attempts'])) {
     $_SESSION['attempts'] = 0;
@@ -1961,7 +2027,7 @@ th{font-size:.7rem;text-transform:uppercase;color:#9ca3af}
 </header>
 
 <div class="notice">
-Delete-only recovery mode. Fast listing enabled: directory sizes are not recursively calculated.
+Delete-only recovery mode. Directory sizes are calculated recursively (via <code>du</code>) for the folders shown on this page.
 </div>
 
 <nav class="crumbs">
@@ -2043,7 +2109,7 @@ FM_PHPEOF
 
     chmod 644 "$FILEMANAGER_SCRIPT" 2>/dev/null || true
 
-    rm -f "$BASE_DIR/.filemanager_v3" 2>/dev/null || true
+    rm -f "$BASE_DIR/.filemanager_v4" 2>/dev/null || true
     touch "$marker" 2>/dev/null || true
 }
 
