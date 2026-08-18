@@ -1325,63 +1325,720 @@ stop_network_proxy() {
 }
 
 FILEMANAGER_SCRIPT="$BASE_DIR/filemanager.php"
+
 ensure_filemanager_script() {
-    if [[ -f "$FILEMANAGER_SCRIPT" && -f "$BASE_DIR/.filemanager_v3" ]]; then return 0; fi
+    local marker="$BASE_DIR/.filemanager_v4"
+
+    if [[ -f "$FILEMANAGER_SCRIPT" && -f "$marker" ]]; then
+        return 0
+    fi
+
     cat > "$FILEMANAGER_SCRIPT" << 'FM_PHPEOF'
 <?php
-ini_set('session.use_strict_mode', '1'); ini_set('session.use_only_cookies', '1'); ini_set('session.cookie_httponly', '1'); session_start();
-$rootfs = getenv('FM_ROOTFS') ?: '/'; $passFile = getenv('FM_PASS_FILE') ?: ''; $csName = getenv('FM_NAME') ?: 'codespace';
-$authPass = ''; if ($passFile !== '' && is_file($passFile)) $authPass = trim(file_get_contents($passFile));
-function csrf_token() { if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32)); return $_SESSION['csrf']; }
-function check_csrf($t) { return !empty($_SESSION['csrf']) && hash_equals($_SESSION['csrf'], $t ?? ''); }
-function safe_path($rel, $rootfs) {
-    $root = realpath($rootfs); if (!$root) return null; $rel = str_replace("\0", '', $rel);
-    if ($rel === '' || $rel === '.' || $rel === '/') return $root;
-    $c = $root . DIRECTORY_SEPARATOR . ltrim(str_replace('\\', '/', $rel), '/'); $r = realpath($c);
-    if ($r) return ($r === $root || str_starts_with($r, $root . DIRECTORY_SEPARATOR)) ? $r : null;
-    $parts = []; foreach (explode('/', trim(str_replace('\\', '/', $rel), '/')) as $p) { if ($p === '' || $p === '.') continue; if ($p === '..') { array_pop($parts); continue; } $parts[] = $p; }
-    $n = $root . DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts); return str_starts_with($n, $root . DIRECTORY_SEPARATOR) ? $n : null;
+date_default_timezone_set('UTC');
+
+if (!defined('SCANDIR_SORT_NONE')) {
+    define('SCANDIR_SORT_NONE', 1);
 }
-function del_dir($d) { $i = @scandir($d); if (!$i) return false; $ok = true; foreach ($i as $x) { if ($x === '.' || $x === '..') continue; $p = $d.'/'.$x; $ok = (is_dir($p) && !is_link($p) ? del_dir($p) : @unlink($p)) && $ok; } return @rmdir($d) && $ok; }
-function h($v) { return htmlspecialchars($v, ENT_QUOTES, 'UTF-8'); }
-function enc($v) { return rawurlencode($v); }
-function human_size($b) { if ($b<1024) return $b.' B'; if ($b<1048576) return round($b/1024,1).' KB'; if ($b<1073741824) return round($b/1048576,1).' MB'; return round($b/1073741824,2).' GB'; }
-function dir_size($p) { $t=0; $s=[$p]; while($s) { $c=array_pop($s); $i=@scandir($c); if(!$i) continue; foreach($i as $n) { if($n=='.'||$n=='..') continue; $ch=$c.'/'.$n; if(@is_link($ch)) continue; if(@is_dir($ch)) $s[]=$ch; else $t+=(int)(@filesize($ch)?:0); } } return $t; }
-function scan($d, $r) {
-    $e = @scandir($d); if (!$e) return []; $res = [];
-    foreach ($e as $n) { if ($n==='.'||$n==='..') continue; $p=$d.'/'.$n; $il=@is_link($p); $st=@lstat($p); $id=$st&&!$il&&(($st['mode']&0170000)===0040000);
-        $b=$id?dir_size($p):(int)($st['size']??0); $res[]=['name'=>$n, 'rel'=>($r?$r.'/':'').$n, 'is_dir'=>$id, 'is_link'=>$il, 'size'=>$b, 'size_human'=>human_size($b), 'mtime'=>(int)(@filemtime($p)?:0)]; }
-    return $res;
+
+$cookieSecure =
+    (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+    (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+
+ini_set('session.use_strict_mode', '1');
+ini_set('session.use_only_cookies', '1');
+ini_set('session.cookie_httponly', '1');
+
+if ($cookieSecure) {
+    ini_set('session.cookie_secure', '1');
 }
-if (!isset($_SESSION['attempts'])) $_SESSION['attempts']=0; if (!isset($_SESSION['lockuntil'])) $_SESSION['lockuntil']=0; $err=null;
-if ($_SERVER['REQUEST_METHOD']==='POST') {
-    $a=$_POST['action']??'';
-    if ($a==='login') {
-        if (time()<$_SESSION['lockuntil']) { http_response_code(429); exit("Wait ".($_SESSION['lockuntil']-time())."s."); }
-        if ($authPass!=='' && hash_equals($authPass, (string)($_POST['password']??''))) { $_SESSION['authed']=true; session_regenerate_id(true); header('Location: /'); exit; }
-        if (++$_SESSION['attempts']>=5) { $_SESSION['lockuntil']=time()+60; $_SESSION['attempts']=0; } $err='Bad pass.';
-    } elseif ($a==='logout') { session_destroy(); header('Location: /'); exit; }
-    elseif ($a==='delete') {
-        if (empty($_SESSION['authed'])||!check_csrf($_POST['csrf']??null)) { http_response_code(403); exit('Forbidden'); }
-        $t=safe_path($_POST['path']??'', $rootfs); $root=realpath($rootfs);
-        if (!$t||!$root||$t===$root) { http_response_code(400); exit('Bad path'); }
-        $ok = is_dir($t)&&!is_link($t) ? del_dir($t) : @unlink($t); if (!$ok) { http_response_code(500); exit('Del fail'); }
-        header('Location: /?dir='.enc(dirname($_POST['path']??'')==='.'?'':dirname($_POST['path']??''))); exit;
+
+session_name('FM_RECOVERY_SESSID');
+
+if (PHP_VERSION_ID >= 70300) {
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'domain' => '',
+        'secure' => $cookieSecure,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+} else {
+    session_set_cookie_params(0, '/', '', $cookieSecure, true);
+}
+
+session_start();
+
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: same-origin');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+
+$rootfs = getenv('FM_ROOTFS') ?: '/';
+$passFile = getenv('FM_PASS_FILE') ?: '';
+$csName = getenv('FM_NAME') ?: 'codespace';
+
+$authPass = '';
+if ($passFile !== '' && is_file($passFile)) {
+    $authPass = trim((string)file_get_contents($passFile));
+}
+
+define('FM_CREDIT', 'Made By Aryan Giri | giriaryan694-a11y');
+
+$rootReal = realpath($rootfs);
+if ($rootReal === false) {
+    http_response_code(500);
+    exit('Invalid FM_ROOTFS.');
+}
+
+if (!function_exists('str_starts_with')) {
+    function str_starts_with($haystack, $needle) {
+        $haystack = (string)$haystack;
+        $needle = (string)$needle;
+
+        if ($needle === '') {
+            return true;
+        }
+
+        return strncmp($haystack, $needle, strlen($needle)) === 0;
     }
 }
-if (empty($_SESSION['authed'])) { ?>
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recovery</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#e5e7eb;font-family:system-ui}.card{width:min(380px,92vw);padding:28px;background:#1f2937;border-radius:14px}h1{font-size:1.1rem;text-align:center;color:#f87171}input,button{width:100%;padding:11px;border-radius:8px;font:inherit;margin-top:10px}input{background:#111827;border:1px solid #374151;color:#fff}button{border:0;background:#dc2626;color:#fff}</style></head><body><main class="card"><h1>Recovery File Manager</h1><form method="post"><input type="hidden" name="action" value="login"><input type="password" name="password" placeholder="Password" autofocus required><button>Unlock</button></form><?php if($err): ?><p style="color:#f87171;text-align:center"><?=h($err)?></p><?php endif; ?></main></body></html>
-<?php exit; }
-$dirRel = $_GET['dir']??''; $dirPath = safe_path($dirRel, $rootfs); if (!$dirPath||!is_dir($dirPath)) { $dirRel=''; $dirPath=realpath($rootfs); }
-$rootReal = realpath($rootfs); $dp = $dirPath===$rootReal ? '/' : '/'.ltrim(substr($dirPath, strlen($rootReal)), '/');
-$crumbs = [['name'=>'/', 'rel'=>'']]; $acc=''; foreach (array_filter(explode('/', $dp)) as $p) { $acc.='/'.$p; $crumbs[]=['name'=>$p, 'rel'=>ltrim($acc, '/')]; }
-$entries = scan($dirPath, $dirRel); usort($entries, function($a,$b){ if($a['is_dir']!==$b['is_dir']) return $a['is_dir']?-1:1; return strcasecmp($a['name'], $b['name']); });
+
+function csrf_token() {
+    if (empty($_SESSION['csrf'])) {
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    }
+
+    return $_SESSION['csrf'];
+}
+
+function check_csrf($token) {
+    return !empty($_SESSION['csrf']) && is_string($token) && hash_equals($_SESSION['csrf'], $token);
+}
+
+function h($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
+
+function human_size($bytes) {
+    $bytes = max(0, (int)$bytes);
+
+    if ($bytes < 1024) {
+        return $bytes . ' B';
+    }
+
+    if ($bytes < 1048576) {
+        return round($bytes / 1024, 1) . ' KB';
+    }
+
+    if ($bytes < 1073741824) {
+        return round($bytes / 1048576, 1) . ' MB';
+    }
+
+    return round($bytes / 1073741824, 2) . ' GB';
+}
+
+function fm_url($params = []) {
+    $script = isset($_SERVER['SCRIPT_NAME']) ? (string)$_SERVER['SCRIPT_NAME'] : '/';
+
+    if ($script === '') {
+        $script = '/';
+    }
+
+    $query = http_build_query($params, '', '&');
+
+    if ($query === '') {
+        return $script;
+    }
+
+    return $script . '?' . $query;
+}
+
+function dir_url($dirRel, $page = null) {
+    $params = [];
+
+    $dirRel = (string)$dirRel;
+
+    if ($dirRel !== '') {
+        $params['dir'] = $dirRel;
+    }
+
+    if ($page !== null && $page > 1) {
+        $params['page'] = $page;
+    }
+
+    return fm_url($params);
+}
+
+function path_prefix($root) {
+    return $root === '/' ? '/' : $root . '/';
+}
+
+function safe_path($rel, $rootfs, $allowSymlink = false) {
+    $root = realpath($rootfs);
+
+    if ($root === false) {
+        return null;
+    }
+
+    $rel = str_replace(["\0", '\\'], ['', '/'], (string)$rel);
+    $rel = trim($rel);
+
+    if ($rel === '' || $rel === '.' || $rel === '/') {
+        return $root;
+    }
+
+    $rel = ltrim($rel, '/');
+
+    $parts = [];
+
+    foreach (explode('/', $rel) as $part) {
+        if ($part === '' || $part === '.') {
+            continue;
+        }
+
+        if ($part === '..') {
+            if (!$parts) {
+                return null;
+            }
+
+            array_pop($parts);
+            continue;
+        }
+
+        $parts[] = $part;
+    }
+
+    if (!$parts) {
+        return $root;
+    }
+
+    $base = rtrim($root, '/');
+    $logical = ($base === '' ? '/' : $base . '/') . implode('/', $parts);
+
+    if (is_link($logical)) {
+        return $allowSymlink ? $logical : null;
+    }
+
+    if (!file_exists($logical)) {
+        return null;
+    }
+
+    $real = realpath($logical);
+
+    if ($real === false) {
+        return null;
+    }
+
+    if ($real === $root) {
+        return $real;
+    }
+
+    if (!str_starts_with($real, path_prefix($root))) {
+        return null;
+    }
+
+    return $real;
+}
+
+function parent_rel($rel) {
+    $rel = str_replace(["\0", '\\'], ['', '/'], (string)$rel);
+    $rel = trim($rel);
+    $rel = trim($rel, '/');
+
+    if ($rel === '') {
+        return '';
+    }
+
+    $parts = explode('/', $rel);
+    array_pop($parts);
+
+    return implode('/', $parts);
+}
+
+function rel_from_root($path, $root) {
+    if ($path === $root) {
+        return '';
+    }
+
+    $rel = substr($path, strlen($root));
+
+    return trim(str_replace('\\', '/', $rel), '/');
+}
+
+function verify_password($input, $stored) {
+    $stored = trim((string)$stored);
+    $input = (string)$input;
+
+    if ($stored === '') {
+        return false;
+    }
+
+    if (function_exists('password_get_info')) {
+        $info = password_get_info($stored);
+
+        if (!empty($info['algo'])) {
+            return password_verify($input, $stored);
+        }
+    }
+
+    return hash_equals($stored, $input);
+}
+
+function del_tree($path) {
+    if (is_link($path)) {
+        return @unlink($path);
+    }
+
+    if (!is_dir($path)) {
+        return @unlink($path);
+    }
+
+    $stack = [$path];
+    $removeDirs = [];
+
+    while ($stack) {
+        $current = array_pop($stack);
+
+        $items = @scandir($current);
+
+        if ($items === false) {
+            return false;
+        }
+
+        foreach ($items as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+
+            $p = $current . '/' . $name;
+
+            if (is_link($p)) {
+                if (!@unlink($p)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (is_dir($p)) {
+                $stack[] = $p;
+                continue;
+            }
+
+            if (!@unlink($p)) {
+                return false;
+            }
+        }
+
+        $removeDirs[] = $current;
+    }
+
+    foreach (array_reverse($removeDirs) as $dir) {
+        if (!@rmdir($dir)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function scan_fast($dir, $rel) {
+    $items = @scandir($dir, SCANDIR_SORT_NONE);
+
+    if ($items === false) {
+        return [];
+    }
+
+    $out = [];
+
+    foreach ($items as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+
+        $path = $dir . '/' . $name;
+        $entryRel = ($rel === '' ? $name : $rel . '/' . $name);
+
+        $st = @lstat($path);
+
+        if ($st === false) {
+            $out[] = [
+                'name' => $name,
+                'rel' => $entryRel,
+                'is_dir' => false,
+                'is_link' => false,
+                'size' => 0,
+                'size_human' => '-',
+                'mtime' => 0,
+            ];
+            continue;
+        }
+
+        $mode = $st['mode'] & 0170000;
+
+        $isLink = ($mode === 0120000);
+        $isDir = (!$isLink && $mode === 0040000);
+
+        $size = $isDir ? 0 : (int)($st['size'] ?? 0);
+        $sizeHuman = $isDir ? '—' : human_size($size);
+
+        $out[] = [
+            'name' => $name,
+            'rel' => $entryRel,
+            'is_dir' => $isDir,
+            'is_link' => $isLink,
+            'size' => $size,
+            'size_human' => $sizeHuman,
+            'mtime' => (int)($st['mtime'] ?? 0),
+        ];
+    }
+
+    return $out;
+}
+
+if (!isset($_SESSION['attempts'])) {
+    $_SESSION['attempts'] = 0;
+}
+
+if (!isset($_SESSION['lockuntil'])) {
+    $_SESSION['lockuntil'] = 0;
+}
+
+$err = null;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'login') {
+        if (!check_csrf($_POST['csrf'] ?? null)) {
+            $err = 'Invalid session token.';
+        } elseif (time() < $_SESSION['lockuntil']) {
+            http_response_code(429);
+            exit('Locked. Wait ' . (int)($_SESSION['lockuntil'] - time()) . 's.');
+        } else {
+            $ok = ($authPass !== '') && verify_password((string)($_POST['password'] ?? ''), $authPass);
+
+            if ($ok) {
+                session_regenerate_id(true);
+
+                $_SESSION = [];
+                $_SESSION['authed'] = true;
+                $_SESSION['csrf'] = bin2hex(random_bytes(32));
+
+                header('Location: ' . fm_url([]));
+                exit;
+            }
+
+            if (++$_SESSION['attempts'] >= 5) {
+                $_SESSION['lockuntil'] = time() + 60;
+                $_SESSION['attempts'] = 0;
+            }
+
+            $err = 'Bad pass.';
+        }
+    } elseif ($action === 'logout') {
+        if (!empty($_SESSION['authed'])) {
+            $_SESSION = [];
+
+            if (ini_get('session.use_cookies')) {
+                $params = session_get_cookie_params();
+
+                setcookie(
+                    session_name(),
+                    '',
+                    time() - 42000,
+                    $params['path'],
+                    $params['domain'],
+                    $params['secure'],
+                    $params['httponly']
+                );
+            }
+
+            session_destroy();
+        }
+
+        header('Location: ' . fm_url([]));
+        exit;
+    } elseif ($action === 'delete') {
+        if (empty($_SESSION['authed']) || !check_csrf($_POST['csrf'] ?? null)) {
+            http_response_code(403);
+            exit('Forbidden');
+        }
+
+        $rel = (string)($_POST['path'] ?? '');
+        $target = safe_path($rel, $rootfs, true);
+
+        if (!$target || $target === $rootReal) {
+            http_response_code(400);
+            exit('Bad path');
+        }
+
+        if (!is_link($target) && !file_exists($target)) {
+            http_response_code(404);
+            exit('Not found');
+        }
+
+        $ok = del_tree($target);
+
+        if (!$ok) {
+            http_response_code(500);
+            exit('Delete failed');
+        }
+
+        $parent = parent_rel($rel);
+
+        if ($parent !== '' && safe_path($parent, $rootfs, false) === null) {
+            $parent = '';
+        }
+
+        header('Location: ' . dir_url($parent));
+        exit;
+    }
+}
+
+if (empty($_SESSION['authed'])) {
+    $loginCsrf = csrf_token();
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="author" content="<?=h(FM_CREDIT)?>">
+<title>Recovery File Manager</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#e5e7eb;font-family:system-ui}
+.card{width:min(380px,92vw);padding:28px;background:#1f2937;border-radius:14px}
+h1{font-size:1.1rem;text-align:center;color:#f87171}
+input,button{width:100%;padding:11px;border-radius:8px;font:inherit;margin-top:10px}
+input{background:#111827;border:1px solid #374151;color:#fff}
+button{border:0;background:#dc2626;color:#fff;cursor:pointer}
+button:hover{background:#ef4444}
+.error{color:#f87171;text-align:center}
+.credit{margin-top:14px;font-size:.72rem;color:#9ca3af;text-align:center}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Recovery File Manager</h1>
+<form method="post" action="<?=h(fm_url([]))?>">
+<input type="hidden" name="action" value="login">
+<input type="hidden" name="csrf" value="<?=h($loginCsrf)?>">
+<input type="password" name="password" placeholder="Password" autofocus required>
+<button>Unlock</button>
+</form>
+<?php if ($err): ?>
+<p class="error"><?=h($err)?></p>
+<?php endif; ?>
+<footer class="credit"><?=h(FM_CREDIT)?></footer>
+</main>
+</body>
+</html>
+<?php
+    exit;
+}
+
+$dirRelRaw = (string)($_GET['dir'] ?? '');
+$dirPath = safe_path($dirRelRaw, $rootfs, false);
+
+if ($dirPath === null || !is_dir($dirPath) || is_link($dirPath)) {
+    $dirPath = $rootReal;
+}
+
+$dirRel = rel_from_root($dirPath, $rootReal);
+$displayPath = '/' . $dirRel;
+
+$crumbs = [['name' => '/', 'rel' => '']];
+
+if ($dirRel !== '') {
+    $acc = '';
+
+    foreach (explode('/', $dirRel) as $part) {
+        if ($part === '') {
+            continue;
+        }
+
+        $acc .= '/' . $part;
+
+        $crumbs[] = [
+            'name' => $part,
+            'rel' => ltrim($acc, '/'),
+        ];
+    }
+}
+
+$entries = scan_fast($dirPath, $dirRel);
+
+usort($entries, function ($a, $b) {
+    if ($a['is_dir'] !== $b['is_dir']) {
+        return $a['is_dir'] ? -1 : 1;
+    }
+
+    if ($a['is_link'] !== $b['is_link']) {
+        return $a['is_link'] ? 1 : -1;
+    }
+
+    return strcasecmp($a['name'], $b['name']);
+});
+
+$total = count($entries);
+
+$perPage = (int)(getenv('FM_PER_PAGE') ?: 500);
+
+if ($perPage < 100) {
+    $perPage = 100;
+}
+
+if ($perPage > 2000) {
+    $perPage = 2000;
+}
+
+$page = max(1, (int)($_GET['page'] ?? 1));
+$pages = max(1, (int)ceil($total / $perPage));
+
+if ($page > $pages) {
+    $page = $pages;
+}
+
+$entries = array_slice($entries, ($page - 1) * $perPage, $perPage);
 $csrf = csrf_token();
 ?>
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recovery</title><style>*{box-sizing:border-box}body{margin:0;padding:16px;background:#111827;color:#e5e7eb;font-family:system-ui}.wrap{max-width:1200px;margin:auto}.header{display:flex;justify-content:space-between;background:#1f2937;padding:16px;border-radius:12px 12px 0 0}.title{font-weight:700;color:#f87171}.logout,.del-btn{background:transparent;border:1px solid #ef4444;color:#f87171;border-radius:7px;padding:7px 10px;cursor:pointer}.logout:hover,.del-btn:hover{background:#dc2626;color:#fff}.notice{margin:12px 0;padding:12px;background:#3f1d1d;border:1px solid #7f1d1d;border-radius:8px;color:#fca5a5}.crumbs{display:flex;gap:6px;padding:10px 12px;background:#172554}.crumbs a{color:#bfdbfe;text-decoration:none}.table-wrap{overflow:auto;background:#1f2937;border-radius:0 0 12px 12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #374151;font-size:.82rem}th{font-size:.7rem;text-transform:uppercase;color:#9ca3af}.name a{color:#bfdbfe;text-decoration:none}.size{text-align:right}.empty{text-align:center;color:#6b7280;padding:30px}</style></head><body><main class="wrap"><header class="header"><div><div class="title">Recovery File Manager</div><div style="font-size:.75rem;color:#9ca3af">Codespace: <?=h($csName)?> · Path: <?=h($dp)?></div></div><form method="post"><input type="hidden" name="action" value="logout"><button class="logout">Logout</button></form></header><div class="notice">Delete-only recovery mode. Free up space.</div><nav class="crumbs"><?php foreach($crumbs as $i=>$c): ?><?php if($i): ?><span>/</span><?php endif; ?><a href="/?dir=<?=enc($c['rel'])?>"><?=h($c['name'])?></a><?php endforeach; ?></nav><div class="table-wrap"><table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody><?php if(!$entries): ?><tr><td colspan="4" class="empty">Empty or unreadable.</td></tr><?php endif; ?><?php foreach($entries as $e): ?><tr><td class="name"><?php if($e['is_dir']): ?><a href="/?dir=<?=enc($e['rel'])?>"><?=h($e['name'])?></a><?php else: ?><?=h($e['name'])?><?php endif; ?></td><td class="size"><?=h($e['size_human'])?></td><td><?=$e['mtime']?h(date('Y-m-d H:i', $e['mtime'])):'-'?></td><td><form method="post" onsubmit="return confirm('Delete <?=h($e['name'])?>?')"><input type="hidden" name="action" value="delete"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="path" value="<?=h($e['rel'])?>"><button class="del-btn">Delete</button></form></td></tr><?php endforeach; ?></tbody></table></div></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="author" content="<?=h(FM_CREDIT)?>">
+<title>Recovery File Manager</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#111827;color:#e5e7eb;font-family:system-ui}
+.wrap{max-width:1200px;margin:auto}
+.header{display:flex;justify-content:space-between;gap:12px;background:#1f2937;padding:16px;border-radius:12px 12px 0 0}
+.title{font-weight:700;color:#f87171}
+.meta{font-size:.75rem;color:#9ca3af}
+.credit{font-size:.72rem;color:#9ca3af}
+.footer{margin-top:12px;text-align:center}
+.logout,.del-btn{background:transparent;border:1px solid #ef4444;color:#f87171;border-radius:7px;padding:7px 10px;cursor:pointer}
+.logout:hover,.del-btn:hover{background:#dc2626;color:#fff}
+.notice{margin:12px 0;padding:12px;background:#3f1d1d;border:1px solid #7f1d1d;border-radius:8px;color:#fca5a5}
+.crumbs{display:flex;flex-wrap:wrap;gap:6px;padding:10px 12px;background:#172554}
+.crumbs a{color:#bfdbfe;text-decoration:none}
+.pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:10px 12px;background:#1f2937}
+.pager a{color:#bfdbfe;text-decoration:none}
+.table-wrap{overflow:auto;background:#1f2937;border-radius:0 0 12px 12px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #374151;font-size:.82rem}
+th{font-size:.7rem;text-transform:uppercase;color:#9ca3af}
+.name a{color:#bfdbfe;text-decoration:none}
+.size{text-align:right}
+.empty{text-align:center;color:#6b7280;padding:30px}
+</style>
+</head>
+<body>
+<main class="wrap">
+<header class="header">
+<div>
+<div class="title">Recovery File Manager</div>
+<div class="meta">Codespace: <?=h($csName)?> · Path: <?=h($displayPath)?></div>
+<div class="credit"><?=h(FM_CREDIT)?></div>
+</div>
+<form method="post" action="<?=h(fm_url([]))?>">
+<input type="hidden" name="action" value="logout">
+<button class="logout">Logout</button>
+</form>
+</header>
+
+<div class="notice">
+Delete-only recovery mode. Fast listing enabled: directory sizes are not recursively calculated.
+</div>
+
+<nav class="crumbs">
+<?php foreach ($crumbs as $i => $crumb): ?>
+<?php if ($i > 0): ?><span>/</span><?php endif; ?>
+<a href="<?=h(dir_url($crumb['rel']))?>"><?=h($crumb['name'])?></a>
+<?php endforeach; ?>
+</nav>
+
+<?php if ($pages > 1): ?>
+<div class="pager">
+<div>
+<?php if ($page > 1): ?>
+<a href="<?=h(dir_url($dirRel, $page - 1))?>">Prev</a>
+<?php endif; ?>
+<?php if ($page < $pages): ?>
+<a href="<?=h(dir_url($dirRel, $page + 1))?>">Next</a>
+<?php endif; ?>
+</div>
+<span>Page <?=h($page)?> / <?=h($pages)?> · <?=h($total)?> items</span>
+</div>
+<?php endif; ?>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Size</th>
+<th>Modified</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<?php if (!$entries): ?>
+<tr>
+<td colspan="4" class="empty">Empty or unreadable.</td>
+</tr>
+<?php endif; ?>
+
+<?php foreach ($entries as $entry): ?>
+<tr>
+<td class="name">
+<?php if ($entry['is_dir']): ?>
+<a href="<?=h(dir_url($entry['rel']))?>"><?=h($entry['name'])?>/</a>
+<?php elseif ($entry['is_link']): ?>
+<span title="Symbolic link"><?=h($entry['name'])?>@</span>
+<?php else: ?>
+<?=h($entry['name'])?>
+<?php endif; ?>
+</td>
+<td class="size"><?=h($entry['size_human'])?></td>
+<td>
+<?php if ($entry['mtime']): ?>
+<?=h(date('Y-m-d H:i', $entry['mtime']))?>
+<?php else: ?>
+-
+<?php endif; ?>
+</td>
+<td>
+<form method="post" onsubmit="return confirm('Delete this item?')">
+<input type="hidden" name="action" value="delete">
+<input type="hidden" name="csrf" value="<?=h($csrf)?>">
+<input type="hidden" name="path" value="<?=h($entry['rel'])?>">
+<button class="del-btn">Delete</button>
+</form>
+</td>
+</tr>
+<?php endforeach; ?>
+</tbody>
+</table>
+</div>
+
+<footer class="credit footer"><?=h(FM_CREDIT)?></footer>
+</main>
+</body>
+</html>
 FM_PHPEOF
+
     chmod 644 "$FILEMANAGER_SCRIPT" 2>/dev/null || true
-    touch "$BASE_DIR/.filemanager_v3"
+
+    rm -f "$BASE_DIR/.filemanager_v3" 2>/dev/null || true
+    touch "$marker" 2>/dev/null || true
 }
 
 is_filemanager_running() {
