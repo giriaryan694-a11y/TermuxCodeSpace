@@ -304,6 +304,7 @@ migrate_legacy_base() {
         echo -e "${RED}Failed to migrate the existing Ubuntu base.${RESET}"
         press_any_key; return 1
     fi
+    fix_l2s_symlinks "$legacy_rootfs" "$BASE_ROOTFS"
     if proot-distro remove ubuntu >/dev/null 2>&1; then
         echo -e "${GREEN}[+] Legacy CodeSpace Ubuntu container removed.${RESET}"
     else
@@ -322,6 +323,8 @@ prepare_base_image() {
         return 1
     fi
     chmod 755 "$BASE_ROOTFS" 2>/dev/null || true
+    # Fix dangling symlinks (specifically .l2s hardlink emulation) pointing to the temp container
+    fix_l2s_symlinks "$source_rootfs" "$BASE_ROOTFS"
     return 0
 }
 
@@ -2188,7 +2191,7 @@ Delete-only recovery mode. Directory sizes are calculated recursively (via <code
 </table>
 </div>
 
-<footer class="credit footer"><?=h(FM_CREDIT)?></footer>
+<footer class="credit.footer"><?=h(FM_CREDIT)?></footer>
 </main>
 </body>
 </html>
