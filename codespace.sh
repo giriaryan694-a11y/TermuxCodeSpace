@@ -2679,7 +2679,7 @@ start_codespace() {
 #!/data/data/com.termux/files/usr/bin/bash
 set -uo pipefail; unset LD_PRELOAD; mkdir -p "$PREFIX/tmp"
 export HOME=/root USER=root SHELL=/bin/bash TERM="${TERM:-xterm-256color}" LANG=C.UTF-8 PROOT_L2S_DIR="$rootfs/.l2s"
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PREFIX/bin"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ${proxy_env}
 exec "$PROOT_BIN" --kill-on-exit --link2symlink --sysvipc -L --change-id=0:0 --kernel-release="6.17.0-PRoot-Distro" --rootfs="$rootfs" --cwd=/root --bind=/dev --bind=/proc --bind=/sys --bind=/dev/urandom:/dev/random --bind=/proc/self/fd:/dev/fd --bind="$rootfs/tmp:/dev/shm" --bind="$PREFIX" --bind="$PREFIX/tmp:/tmp" /bin/sh -c "exec /usr/local/bin/code-server --bind-addr 0.0.0.0:$port --disable-telemetry"
 LAUNCHER_EOF
@@ -2806,7 +2806,7 @@ cli_codespace() {
         export TERM="${TERM:-xterm-256color}"
         export LANG=C.UTF-8
         export PROOT_L2S_DIR="$rootfs/.l2s"
-        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PREFIX/bin"
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
         if is_proxy_enabled "$name"; then
             export http_proxy="http://127.0.0.1:${proxy_port}"
