@@ -513,7 +513,7 @@ Acquire::https::Timeout "60";
 Acquire::http::Pipeline-Depth "0";
 Acquire::ForceIPv4 "true";
 APTCONF
-apt-get install -y --no-install-recommends ca-certificates curl wget git openssh-client tar gzip xz-utils sudo bash
+apt-get install -y --no-install-recommends ca-certificates curl wget git openssh-client tar gzip xz-utils sudo bash unzip zip
 '; then
         proot-distro remove "$TEMP_DISTRO_NAME" 2>/dev/null || true
         return 1
