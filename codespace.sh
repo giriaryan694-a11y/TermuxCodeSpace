@@ -67,7 +67,13 @@ EOF
     echo
 }
 
-press_any_key() { echo; read -n1 -rsp "Press any key to continue..."; echo; }
+press_any_key() {
+    echo
+    local _junk
+    while read -r -t 0 -n 1 _junk 2>/dev/null; do :; done
+    read -n1 -rsp "Press any key to continue..."
+    echo
+}
 
 read_key() {
     local key rest
@@ -2487,7 +2493,21 @@ start_codespace() {
     if [[ "$quota_mb" -gt 0 ]]; then
         used_mb=$(get_codespace_size_mb "$name")
         if [[ -n "$used_mb" && "$used_mb" -gt "$quota_mb" ]]; then
-            start_filemanager "$name"; [[ "$quiet" != "--quiet" ]] && [[ "$quiet" != "--quiet" ]] && press_any_key; return 1
+            start_filemanager "$name"
+            if [[ "$quiet" != "--quiet" ]]; then
+                local ip; ip=$(device_ip)
+                echo -e "${RED}${BOLD}Codespace '$name' is OVER its storage quota (${used_mb}MB / ${quota_mb}MB).${RESET}"
+                echo -e "${YELLOW}It was not started. Only the recovery file manager is available so you can delete files to get back under quota.${RESET}"
+                echo -e "  Password: ${BOLD}${pass}${RESET}"
+                if is_filemanager_running "$name"; then
+                    echo -e "  Recovery file manager: http://127.0.0.1:${port}"
+                    [[ -n "$ip" ]] && echo -e "                          http://${ip}:${port}"
+                else
+                    echo -e "${RED}  Recovery file manager failed to start (is php installed?).${RESET}"
+                fi
+                press_any_key
+            fi
+            return 1
         fi
     fi
     if is_running "$name"; then echo -e "${YELLOW}Already running.${RESET}"
@@ -2771,4 +2791,3 @@ main_menu() {
     done
 }
 main_menu
-
