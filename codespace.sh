@@ -2705,6 +2705,9 @@ show_codespace_info() {
     echo -e "  Port: ${port:-?}  Pass: ${pass:-?}"
     is_running "$name" && echo -e "  Status: ${GREEN}RUNNING${RESET}" || echo -e "  Status: ${RED}STOPPED${RESET}"
     echo -e "  Storage: $(format_quota_usage "$name")"
+    if is_filemanager_running "$name"; then
+        echo -e "  File Manager: ${GREEN}RUNNING${RESET} (over quota recovery mode - http://127.0.0.1:${port:-?})"
+    fi
     echo -e "  Proxy:   $(proxy_status_colored "$name")"
     mode=$(cat "$META_DIR/$name.netmode" 2>/dev/null || echo "open")
     echo -e "  Network policy: ${CYAN}${mode}${RESET}"
