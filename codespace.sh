@@ -958,6 +958,54 @@ get_codespace_size_mb() {
     echo "$out" | awk '{print $1}' | head -n1
 }
 
+# The management menu only needs a quick, approximate display value. A fresh
+# `du` over a large rootfs can take several seconds on Android storage, so keep
+# the last measured size and refresh it in the background. Quota enforcement
+# and other correctness-sensitive callers continue to use get_codespace_size_mb.
+cached_codespace_size_mb() {
+    local name="$1" cache="$META_DIR/$1.sizecache" cached_at cached_size
+    if [[ -f "$cache" ]]; then
+        read -r cached_at cached_size < "$cache" || true
+        if [[ "${cached_size:-}" =~ ^[0-9]+$ ]]; then
+            echo "$cached_size"
+            return 0
+        fi
+    fi
+    echo "?"
+}
+
+refresh_codespace_size_cache_async() {
+    local lock_dir="$META_DIR/.size-cache-refresh.lock" lock_pid
+
+    # A directory lock works on a minimal Termux install without requiring
+    # flock. Recover stale locks left behind by a killed refresh process.
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -rf "$lock_dir" 2>/dev/null || return 0
+        mkdir "$lock_dir" 2>/dev/null || return 0
+    fi
+
+    (
+        printf '%s\n' "$BASHPID" > "$lock_dir/pid"
+        trap 'rm -rf "$lock_dir"' EXIT
+
+        local name size cache_tmp
+        while IFS= read -r name; do
+            [[ -n "$name" && -d "$CODESPACES_DIR/$name" ]] || continue
+            size=$(get_codespace_size_mb "$name" 2>/dev/null) || continue
+            [[ "$size" =~ ^[0-9]+$ ]] || continue
+
+            cache_tmp="$META_DIR/$name.sizecache.tmp.$BASHPID"
+            if printf '%s %s\n' "$(date +%s)" "$size" > "$cache_tmp" 2>/dev/null; then
+                mv -f "$cache_tmp" "$META_DIR/$name.sizecache" 2>/dev/null || rm -f "$cache_tmp"
+            fi
+        done < <(list_codespaces)
+    ) </dev/null >/dev/null 2>&1 &
+}
+
 format_quota_usage() {
     local name="$1"; local used quota mode
     used=$(get_codespace_size_mb "$name"); quota=$(get_quota_mb "$name"); mode=$(get_quota_mode "$name")
@@ -2887,13 +2935,14 @@ manage_codespaces_menu() {
     while true; do
         local names=()
         while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(list_codespaces)
+        refresh_codespace_size_cache_async
         local options=()
         for n in "${names[@]}"; do
             local status_tag size_tag proxy_tag
             ensure_network_files "$n"
             is_running "$n" && status_tag="[running]" || status_tag="[stopped]"
             proxy_tag="[$(proxy_status_plain "$n")]"
-            size_tag="$(get_codespace_size_mb "$n") MB"
+            size_tag="$(cached_codespace_size_mb "$n") MB"
             options+=("$n  $status_tag  $proxy_tag  ($size_tag)")
         done
         options+=("+ Create New Codespace" "Import Codespace")
