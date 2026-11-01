@@ -64,6 +64,10 @@ It is useful because:
 * Per-codespace domain block/allow list
 * Per-codespace "restricted" (default-deny) network mode toggle
 * Per-codespace proxy on/off switch — turn logging/filtering off for direct, unproxied traffic when you don't need it
+* Optional Wi-Fi LAN Admin Web Panel with a responsive dashboard
+* Create, start, stop, delete, inspect network logs, and rotate credentials from another device
+* Interactive browser terminal scoped to a selected PRoot codespace
+* Random admin credential, session authentication, CSRF checks, login throttling, and selectable HTTP or HTTPS transport
 * `apt` traffic (both the base image and every cloned codespace) is routed through the local proxy and forced onto `https://` mirrors instead of `http://`
 
 ## Requirements
@@ -71,7 +75,7 @@ It is useful because:
 * Termux from [F-Droid](https://f-droid.org/packages/com.termux/) or GitHub Releases
 * Android 7.0 or newer
 * Around 2 GB free storage per codespace
-* `python3` on the Termux host, for the network log/filter proxy (optional — everything else still works without it, you just lose logging/filtering)
+* `python3` on the Termux host, for network logging/filtering and the Admin Web Panel
 
 > **Important:** Do not use the Play Store version of Termux. It is outdated and may not work correctly.
 
@@ -109,9 +113,13 @@ After that, new codespaces are created much faster because they are cloned from 
 
 ```text
 > Manage Codespaces
+> Admin Web Panel: OFF
 > Terminate All
+> Cleanup Everything
 > Exit
 ```
+
+Select **Admin Web Panel: OFF** to enable the LAN dashboard. Its state is retained across normal script exits; selecting it again turns the server off.
 
 ## Creating and Managing Codespaces
 
@@ -132,8 +140,10 @@ Example codespace list:
 | `c`       | Connect to codespace shell                              |
 | `n`       | View live network activity log                          |
 | `b`       | Manage domain block/allow lists                         |
+| `r`       | Revoke and regenerate the selected codespace's password |
 | `R`       | Toggle restricted network mode (press again for open)    |
 | `p`       | Turn the network proxy fully on/off for that codespace   |
+| `s`       | Open storage quota settings                              |
 | `d`       | Delete a codespace                                       |
 | `t`       | Stop a codespace                                         |
 | `q`       | Go back                                                  |
@@ -146,6 +156,110 @@ When creating a codespace, you will be asked for:
 * **Port** — leave blank for automatic assignment, or enter your own
 
 The script generates a unique password, writes the `code-server` config, and starts the server automatically. It also starts that codespace's network proxy (unless you've turned it off with `p`), so logging is active as soon as the codespace is up.
+
+
+## Admin Web Panel (Wi-Fi LAN)
+
+The Admin Web Panel lets you manage TermuxCodeSpace from a laptop, tablet, or another phone connected through the phone hotspot, Wi-Fi, USB tethering, or another reachable private LAN interface. You do not need to open Termux for routine codespace management.
+
+### Enable and configure it
+
+1. Connect the client device to the phone hotspot or to the same trusted private Wi-Fi/LAN.
+2. Run `./codespace.sh` on the phone and select **Admin Web Panel: OFF**.
+3. Choose the transport:
+   * **HTTP** — direct access to the panel. No TLS setup is required.
+   * **HTTPS** — the panel backend stays on `127.0.0.1`; use the [`http2https`](https://github.com/giriaryan694-a11y/http2https) reverse-proxy tool for browser-facing TLS.
+4. Choose **All detected interfaces** or one discovered interface, such as `ap0` (phone hotspot) or `wlan0` (Wi-Fi). Addresses are detected with `ifconfig -a`, with `ip` as a fallback.
+5. Enter the randomly generated admin credential printed by Termux whenever the panel is enabled from the CLI. If the panel was automatically restarted quietly at launch, press lowercase `v` in the main menu to reveal the saved credential again.
+
+The admin credential is retained across panel off/on cycles and stored in `~/.termux-codespace/meta/.admin.pass` with restrictive permissions. Press lowercase `r` in the main menu to revoke it and generate a replacement.
+
+The choice is saved in `~/.termux-codespace/meta/` and is reused when the panel is automatically restarted. Disable the panel from the main menu when you are done.
+
+### HTTP mode
+
+HTTP mode binds either to the selected interface's IPv4 address or to `0.0.0.0` when **All detected interfaces** is selected. Termux prints the matching URL(s), for example:
+
+```text
+http://192.168.43.1:8787
+```
+
+**Security:** HTTP is plaintext. The admin password, session cookie, terminal keystrokes/output, and dashboard data are not encrypted in transit. Use HTTP only on a trusted private home LAN where you trust every connected device. Do not use it on public/guest Wi-Fi, and do not expose the port with router port forwarding. A random password and CSRF protection do not encrypt network traffic.
+
+### HTTPS mode with http2https
+
+TermuxCodeSpace does not generate a self-signed certificate for the Admin Panel. Instead, it runs the panel backend on `127.0.0.1:<internal-port>` and prints the values needed by [`http2https`](https://github.com/giriaryan694-a11y/http2https).
+
+Set up the tool on the phone:
+
+```bash
+git clone https://github.com/giriaryan694-a11y/http2https.git
+cd http2https
+pkg install python python-cryptography
+pip install pyfiglet termcolor colorama requests
+python main.py
+```
+
+When `http2https` asks for configuration, enter:
+
+* **Certificate title:** `TermuxCodeSpace Admin`
+* **Domains/IPs to secure:** the interface IP address(es) printed by Termux for your selected interface
+* **Internal HTTP port:** the Admin Panel's printed `127.0.0.1` backend port
+* **HTTPS port:** the HTTPS proxy port selected in TermuxCodeSpace
+
+Then open `https://<selected-LAN-IP>:<HTTPS-port>` from the laptop or other client device. Install/trust the generated certificate on that client device using the instructions in the `http2https` repository; otherwise the browser will warn that the certificate is not trusted.
+
+The current `http2https` implementation binds its HTTPS listener to `0.0.0.0`. In HTTPS mode, choosing an interface in TermuxCodeSpace selects the intended address(es) and certificate SANs, but does **not** restrict the `http2https` listener to that interface. The Admin Panel's own HTTP backend remains loopback-only. Keep the proxy on a trusted network and do not configure router port forwarding.
+
+### Dashboard features
+
+* Create a codespace, set an optional storage quota, and start it
+* A **View** link appears only while a codespace is running. It opens `http://<same-host-as-admin-panel>:<codespace-port>/` in a new tab, using the exact IP/hostname you used to reach the dashboard. This keeps the link aligned with the hotspot or Wi-Fi interface the laptop is currently using. If the dashboard is opened through `localhost` or a loopback address on the phone itself, it falls back to the first active IPv4 address from the selected interface list.
+* The codeserver listener currently uses plain HTTP (`bind-addr 0.0.0.0:<port>`). Therefore, **View opens HTTP even when the Admin Panel itself uses HTTPS through `http2https`**; that HTTPS proxy is configured for the panel backend only. Use this direct codeserver URL on a trusted private LAN, and do not expose its port through router port forwarding.
+* Import a `.tar.gz` / `.tgz` codespace export directly from the browser, choosing a new name
+* Export any codespace to a downloadable `.tar.gz` archive directly from its action row
+* Start and stop codespaces; a **View** action appears only while a codespace is running and opens its code-server on the same LAN IP used to access the Admin Panel, at that codespace's assigned port
+* Permanently delete selected codespaces
+* View the selected codespace's HTTP and HTTPS proxy log
+* Edit block/allow domain rules, switch open/restricted network mode, and toggle its proxy from the dashboard
+* View and change soft or hard storage quotas from the dashboard (hard quotas depend on device support)
+* Reveal the currently stored password for an individual codespace from its **Password** action, then copy it from the credential dialog. Passwords are fetched only after admin authentication and a CSRF check; they are not included in the dashboard state response. Revealing a password does not rotate it.
+* Open an xterm.js browser terminal backed by a real PTY inside a selected PRoot codespace, with ANSI escape rendering, cursor movement, Backspace, Ctrl key combinations, copy/paste, and automatic terminal resize
+* Revoke and regenerate a codespace password; the same new password is used by code-server and the recovery manager
+* Revoke and regenerate the admin panel credential from **Settings**
+
+### Codespace import and export
+
+The dashboard's **Export** action uses the same archive layout as the existing Termux CLI export: a compressed `.tar.gz` containing the codespace root filesystem and a top-level `codespace.meta` file with its original name, code-server port, and code-server password. If the codespace is running, the panel stops it to create a consistent filesystem snapshot, then attempts to start it again after the export completes. Any browser PTY sessions attached to that codespace are closed before export.
+
+Use **Import codespace** at the top of the Codespaces page to select a `.tar.gz` / `.tgz` archive and choose the destination name. The panel refuses to overwrite an existing codespace, validates archive paths and filesystem entry types before extraction, checks available storage, and preserves the password stored in the archive. Imported codespaces are created stopped; start them from the dashboard when ready. The compressed upload limit is 4 GiB, subject to available storage.
+
+**Archive contents are sensitive.** The export contains the code-server password in `codespace.meta` and in the codeserver configuration inside the root filesystem. Store it privately and do not send it to people or upload it to a public repository. The current CLI archive format does not include separate Termux metadata such as network logs, domain allow/block lists, proxy state, or quota settings; those remain local to the source device and are initialized to defaults on import.
+
+### Browser terminal: xterm.js + PTY
+
+The Admin Panel terminal uses [xterm.js](https://xtermjs.org/) as the browser-side terminal emulator and launches an interactive Bash process through a real pseudo-terminal (PTY) inside the selected PRoot codespace. This is fundamentally different from a command textbox: keystrokes are forwarded to the PTY, and the PTY output (including ANSI control sequences) is rendered by xterm.js.
+
+* Backspace is sent as the terminal's configured erase character and is handled by the shell/PTY line discipline.
+* Enter, Tab, Escape, arrows, Home/End, Page Up/Down and Ctrl combinations are forwarded as terminal input. A mobile extra-key bar provides keys that are awkward to type on a phone keyboard.
+* ANSI colors, cursor movement, interactive prompts, terminal resizing, selection and browser copy/paste are supported by the terminal emulator. Full-screen applications should be substantially more usable than in the previous textarea-based interface, although Android/PRoot compatibility varies by application.
+* In direct **HTTP** mode, the browser uses an authenticated WebSocket for a low-latency, bidirectional PTY stream.
+* In **HTTPS** mode, the current `http2https` proxy does not tunnel WebSocket upgrade connections. The browser therefore uses authenticated HTTP input/output polling (140 ms interval) while retaining xterm.js rendering and PTY resize. This is functional but less responsive than WebSocket, especially for full-screen interactive programs.
+* The xterm.js and fit-addon libraries are loaded from jsDelivr, with an unpkg fallback. The browser needs internet access to load these libraries. No external terminal service receives shell input; the CDN provides the client-side JavaScript libraries only.
+* Disconnecting the terminal, signing out, expiring the admin session, or stopping the panel closes the PTY session. This build does not yet provide Cloud-Shell-style `tmux` persistence across browser reconnects.
+
+Google Cloud Shell documents browser terminal features such as keyboard shortcuts, copy/paste, multiple terminal sessions and terminal preferences. TermuxCodeSpace adopts the browser-terminal/PTY model, but it is not a drop-in recreation of Cloud Shell's session-management infrastructure.
+
+### Credential revocation shortcuts
+
+* In the **main menu**, press lowercase `v` to display the saved admin panel credential in the Termux CLI.
+* In the **main menu**, press lowercase `r` to revoke the admin panel credential. The new credential is printed immediately; existing browser and terminal sessions are invalidated.
+* In **Manage Codespaces**, select a codespace and press lowercase `r` to rotate that codespace's credential. If it was running, it is restarted so the old password stops working.
+* Uppercase `R` remains the network restricted-mode shortcut. Case matters here, because apparently keyboards enjoy having opinions.
+
+Turning the panel off stops its backend but retains its credential and selected transport/interface settings. In HTTPS mode, stop the separate `http2https` process with Ctrl+C in the terminal where it is running as well; TermuxCodeSpace does not own that external proxy process. Cleanup Everything stops the panel and removes its stored settings. Exiting the menu does not turn the panel off.
+
+> **Security note:** The Admin Panel can delete codespaces and provides a shell inside a selected PRoot environment. PRoot is userspace isolation, not a hardened container or Android security boundary. Use the panel only on a trusted private network, disable it when finished, and do not expose it through router port forwarding or use it on untrusted/public networks.
 
 ## Recovery File Manager
 
@@ -359,6 +473,9 @@ Each codespace is a full independent Ubuntu filesystem. Changes made in one envi
 ```text
 ~/.termux-codespace/
 ├── proxy_server.py
+├── admin_panel.py
+├── admin-panel.crt
+├── admin-panel.key
 ├── codespaces/
 │   ├── myproject/
 │   │   ├── bin/
@@ -374,6 +491,12 @@ Each codespace is a full independent Ubuntu filesystem. Changes made in one envi
 │   │   └── tmp/
 │   └── backend-api/
 └── meta/
+    ├── .admin.pass
+    ├── admin.enabled
+    ├── admin.ip
+    ├── admin.port
+    ├── admin.pid
+    ├── admin.log
     ├── myproject.port
     ├── myproject.pass
     ├── myproject.pid
@@ -462,7 +585,7 @@ The script checks for and uses:
 * `bash`
 * `coreutils`
 * `findutils`
-* `python3` (host-side, optional — powers the network log/filter proxy)
+* `python3` (host-side — powers the network log/filter proxy and Admin Web Panel)
 
 ## License
 
@@ -470,7 +593,7 @@ This project is licensed under the **Apache License 2.0**. See the `LICENSE` fil
 
 ## Author
 
-**Aryan Giri** — [giriaryan694-a11y](https://github.com/giriaryan694-a11y)
+**Made By Aryan Giri** — [giriaryan694-a11y](https://github.com/giriaryan694-a11y)
 
 ---
 
