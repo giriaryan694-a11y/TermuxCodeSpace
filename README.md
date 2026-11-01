@@ -67,6 +67,10 @@ It is useful because:
 * Optional Wi-Fi LAN Admin Web Panel with a responsive dashboard
 * Create, start, stop, delete, inspect network logs, and rotate credentials from another device
 * Interactive browser terminal scoped to a selected PRoot codespace
+* Persistent Web Panel export archive library with automatic browser downloads and live transfer status
+* Drag-and-drop codespace imports with upload and extraction progress
+* Stop active exports and cancel imports during upload, extraction, or finalization; partial files are cleaned up
+* Delete all saved exports from the Web Panel while active exports are protected
 * Random admin credential, session authentication, CSRF checks, login throttling, and selectable HTTP or HTTPS transport
 * `apt` traffic (both the base image and every cloned codespace) is routed through the local proxy and forced onto `https://` mirrors instead of `http://`
 
@@ -216,8 +220,12 @@ The current `http2https` implementation binds its HTTPS listener to `0.0.0.0`. I
 * Create a codespace, set an optional storage quota, and start it
 * A **View** link appears only while a codespace is running. It opens `http://<same-host-as-admin-panel>:<codespace-port>/` in a new tab, using the exact IP/hostname you used to reach the dashboard. This keeps the link aligned with the hotspot or Wi-Fi interface the laptop is currently using. If the dashboard is opened through `localhost` or a loopback address on the phone itself, it falls back to the first active IPv4 address from the selected interface list.
 * The codeserver listener currently uses plain HTTP (`bind-addr 0.0.0.0:<port>`). Therefore, **View opens HTTP even when the Admin Panel itself uses HTTPS through `http2https`**; that HTTPS proxy is configured for the panel backend only. Use this direct codeserver URL on a trusted private LAN, and do not expose its port through router port forwarding.
-* Import a `.tar.gz` / `.tgz` codespace export directly from the browser, choosing a new name
-* Export any codespace to a downloadable `.tar.gz` archive directly from its action row
+* Export any codespace from its action row; the archive is compressed in the background and automatically downloaded by the browser when ready
+* Track export compression, browser downloads, import uploads, and archive extraction in the **Exports & imports** tab
+* Use **Stop** on an active export or **Cancel** on an active import; cancellation is handled by the server and cleans up partial output
+* Use **Delete all exports** to remove saved archives and their metadata from the phone; currently running exports are skipped
+* Re-download previous exports from the saved-export list; archives remain in the phone's private `~/.termux-codespace/admin-exports/` directory until manually removed
+* Import `.tar.gz` / `.tgz` archives by choosing a file or dragging and dropping it into the import area, then choose a new codespace name
 * Start and stop codespaces; a **View** action appears only while a codespace is running and opens its code-server on the same LAN IP used to access the Admin Panel, at that codespace's assigned port
 * Permanently delete selected codespaces
 * View the selected codespace's HTTP and HTTPS proxy log
@@ -232,7 +240,11 @@ The current `http2https` implementation binds its HTTPS listener to `0.0.0.0`. I
 
 The dashboard's **Export** action uses the same archive layout as the existing Termux CLI export: a compressed `.tar.gz` containing the codespace root filesystem and a top-level `codespace.meta` file with its original name, code-server port, and code-server password. If the codespace is running, the panel stops it to create a consistent filesystem snapshot, then attempts to start it again after the export completes. Any browser PTY sessions attached to that codespace are closed before export.
 
-Use **Import codespace** at the top of the Codespaces page to select a `.tar.gz` / `.tgz` archive and choose the destination name. The panel refuses to overwrite an existing codespace, validates archive paths and filesystem entry types before extraction, checks available storage, and preserves the password stored in the archive. Imported codespaces are created stopped; start them from the dashboard when ready. The compressed upload limit is 4 GiB, subject to available storage.
+Web Panel exports run as background jobs. The **Exports & imports** tab shows the current compression stage and the amount of compressed data written, then tracks bytes sent during the browser download. Compression uses an animated progress bar with a written-byte counter because gzip does not expose a reliable final compressed-size percentage while the archive is being created. Once compression finishes, the browser automatically downloads the archive to the device running the browser (normally its Downloads folder). A private copy is also retained on the phone in `~/.termux-codespace/admin-exports/`, so it can be downloaded again from **Saved exports** without recompressing the codespace. These archives consume phone storage until removed. The **Delete all exports** action removes saved archives and their metadata in one operation; active exports are left untouched.
+
+Import from the **Exports & imports** tab. Choose a `.tar.gz` / `.tgz` file or drag it into the drop area, then choose the destination name. The tab tracks upload progress and extraction progress. The panel refuses to overwrite an existing codespace, validates archive paths and filesystem entry types before extraction, checks available storage, and preserves the password stored in the archive. Imported codespaces are created stopped; start them from the dashboard when ready. The compressed upload limit is 4 GiB, subject to available storage. While an import is active, use **Cancel** in the Active transfers section to stop its upload, extraction, or finalization. Temporary staging files and any partially created destination codespace are removed.
+
+For an active export, use **Stop** in Active transfers. The partial archive is removed, and if the codespace was running before export, the panel attempts to start it again after stopping the export process. Cancellation of an already-started browser download is controlled by the browser download UI.
 
 **Archive contents are sensitive.** The export contains the code-server password in `codespace.meta` and in the codeserver configuration inside the root filesystem. Store it privately and do not send it to people or upload it to a public repository. The current CLI archive format does not include separate Termux metadata such as network logs, domain allow/block lists, proxy state, or quota settings; those remain local to the source device and are initialized to defaults on import.
 
