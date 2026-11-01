@@ -652,9 +652,9 @@ device_ipv4_records() {
 admin_panel_enabled() { [[ "$(cat "$META_DIR/admin.enabled" 2>/dev/null)" == "on" ]]; }
 
 ensure_admin_server_script() {
-    local marker="$BASE_DIR/.admin_server_v8"
+    local marker="$BASE_DIR/.admin_server_v10"
     if [[ -f "$ADMIN_SERVER_SCRIPT" && -f "$marker" ]]; then return 0; fi
-    # An older server process cannot load new dashboard routes just because its source file was replaced. Stop it before installing v8.
+    # An older server process cannot load new dashboard routes just because its source file was replaced. Stop it before installing v9.
     if [[ -f "$META_DIR/admin.pid" ]]; then
         stop_admin_panel >/dev/null 2>&1 || true
     fi
@@ -701,6 +701,9 @@ SESSION_TTL = 12 * 60 * 60
 MAX_TERMINALS = 8
 TERMINAL_BUFFER_LIMIT = 250_000
 
+class TransferCancelled(Exception):
+    """Raised when an authenticated user cancels an import/export job."""
+
 HTML = r'''<!doctype html>
 <html lang="en">
 <head>
@@ -714,15 +717,23 @@ HTML = r'''<!doctype html>
 button,input,select,textarea{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:10px;padding:9px 13px;color:var(--text);background:#1a2942;transition:.15s}button:hover{border-color:#54739d;transform:translateY(-1px)}button:disabled{opacity:.5;cursor:wait;transform:none}.primary{background:var(--accent);border-color:var(--accent);color:#071a17;font-weight:750}.danger{color:#ffdce2;background:#3b1b2a;border-color:#6b2d43}.quiet{background:transparent}.small{padding:6px 9px;font-size:12px}.muted{color:var(--muted)}.hidden{display:none!important}
 #login{min-height:100vh;display:grid;place-items:center;padding:22px}.login-card{width:min(420px,100%);background:rgba(17,26,45,.94);border:1px solid var(--line);border-radius:22px;padding:28px;box-shadow:0 24px 80px #0008}.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,#72e4bc,#7da7ff);display:grid;place-items:center;color:#09202a;font-weight:900;font-size:18px}.brand h1{font-size:18px;margin:0}.brand p{margin:3px 0 0;color:var(--muted);font-size:12px}.login-card h2{margin:28px 0 7px;font-size:23px}.login-card label,.field label{display:block;color:var(--muted);font-size:12px;margin:15px 0 7px}.login-card input,.field input,.field select{width:100%;border:1px solid var(--line);background:#0b1426;color:var(--text);border-radius:10px;padding:12px;outline:none}.login-card input:focus,.field input:focus,.field select:focus{border-color:var(--blue)}.login-card button{width:100%;margin-top:18px;padding:12px}.error{color:#ff9aa8;min-height:20px;font-size:13px;margin-top:10px}
 #app{display:none}.topbar{height:70px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#0b1020d9;position:sticky;top:0;z-index:5;backdrop-filter:blur(14px)}.topbar .brand-mark{width:36px;height:36px;border-radius:11px}.topbar .brand h1{font-size:15px}.top-right{display:flex;align-items:center;gap:12px}.lan-tag{font-size:11px;color:var(--accent);border:1px solid #285a50;background:#102820;padding:6px 9px;border-radius:20px}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1480px;margin:auto;min-height:calc(100vh - 70px)}aside{padding:25px 15px;border-right:1px solid var(--line)}.nav-label{font-size:10px;letter-spacing:1.3px;color:#64748b;padding:8px 12px}.nav{display:flex;align-items:center;gap:11px;width:100%;text-align:left;background:transparent;border-color:transparent;color:#aab8ce;padding:11px 12px;margin:2px 0}.nav.active{color:var(--text);background:#1a2b43;border-color:#304565}.nav .ico{width:18px;text-align:center;color:var(--accent)}main{padding:30px;min-width:0}.page-head{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:24px}.page-head h2{font-size:25px;letter-spacing:-.5px;margin:0}.page-head p{margin:6px 0 0;color:var(--muted);font-size:13px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:20px}.stat,.card{background:linear-gradient(160deg,#15223a,#111a2c);border:1px solid var(--line);border-radius:var(--radius)}.stat{padding:17px}.stat .label{color:var(--muted);font-size:12px}.stat .value{font-size:27px;font-weight:750;margin-top:8px}.stat .sub{color:#6e809d;font-size:11px;margin-top:3px}.card{padding:19px;margin-bottom:16px}.card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.card-head h3{font-size:15px;margin:0}.card-head p{font-size:12px;color:var(--muted);margin:4px 0 0}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:620px}th{text-align:left;font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:#8292aa;font-weight:650;padding:11px;border-bottom:1px solid var(--line)}td{padding:13px 11px;border-bottom:1px solid #202d43;font-size:13px}tr:last-child td{border-bottom:0}.space-name{font-weight:700}.space-port{font-size:11px;color:var(--muted);margin-top:4px}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:30px;padding:5px 8px;font-size:10px;border:1px solid var(--line);color:#b9c8dc}.pill:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.pill.on{color:var(--accent);border-color:#2b6054}.pill.off{color:#93a1b8}.pill.warn{color:var(--amber);border-color:#69552c}.actions{display:flex;flex-wrap:wrap;gap:6px}.actions a.small{display:inline-flex;align-items:center;text-decoration:none}.empty{padding:35px;text-align:center;color:var(--muted)}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.field{min-width:150px}.field input,.field select{padding:9px}.log-box{background:#080e1a;border:1px solid #1d2a40;border-radius:12px;padding:15px;min-height:320px;max-height:58vh;overflow:auto;color:#c7d5e8;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.terminal{background:#070c15;border:1px solid #26334d;border-radius:12px;overflow:hidden}.terminal-top{background:#121d30;padding:10px 13px;display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:11px}.terminal-mount{height:min(62vh,620px);min-height:340px;padding:8px;background:#070c15}.terminal-mount .xterm{height:100%;padding:2px}.terminal-mount .xterm-viewport{overflow-y:auto!important}.terminal-keybar{display:flex;gap:6px;flex-wrap:wrap;padding:9px;background:#101a2b;border-top:1px solid #26334d}.terminal-keybar button{min-width:42px;padding:7px 10px;font:12px ui-monospace,monospace}.terminal-keybar button.active{background:var(--accent);color:#071a17;border-color:var(--accent)}.notice{padding:12px 14px;background:#17253b;border:1px solid #2d4568;border-radius:12px;color:#b9c9e1;font-size:12px;line-height:1.5;margin-bottom:16px}.notice.warn{background:#302617;border-color:#69552c;color:#f2d59a}.modal-backdrop{position:fixed;inset:0;background:#030711bf;display:grid;place-items:center;padding:18px;z-index:10}.modal{width:min(560px,100%);max-height:calc(100vh - 36px);overflow:auto;background:#15223a;border:1px solid #344865;border-radius:18px;padding:22px;box-shadow:0 25px 80px #0009}.modal h3{margin:0 0 8px}.modal p{font-size:13px;color:var(--muted);line-height:1.5}.secret{font-family:ui-monospace,monospace;word-break:break-all;background:#08111f;border:1px solid #304565;border-radius:10px;padding:13px;color:#8ce7c8;font-size:13px;margin:13px 0}.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}.footer{color:#64748b;font-size:11px;text-align:center;padding:20px 0}.toast{position:fixed;right:22px;bottom:22px;background:#1d314b;border:1px solid #3e5c7d;border-radius:11px;padding:12px 16px;font-size:13px;z-index:20;box-shadow:0 12px 40px #0008;max-width:min(420px,calc(100vw - 40px))}
+.transfer-list{display:grid;gap:11px}.transfer-item{background:#0c1628;border:1px solid #263851;border-radius:12px;padding:13px}.transfer-top{display:flex;align-items:center;justify-content:space-between;gap:12px}.transfer-name{font-weight:700;font-size:13px;overflow-wrap:anywhere}.transfer-detail{font-size:11px;color:var(--muted);margin-top:5px}.progress-track{height:9px;background:#25334a;border-radius:20px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;background:linear-gradient(90deg,#62d6b1,#7ba7ff);border-radius:20px;transition:width .2s ease}.progress-fill.indeterminate{width:38%;animation:progress-slide 1.2s ease-in-out infinite}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(290%)}}.progress-meta{display:flex;justify-content:space-between;gap:10px;color:#a9bad2;font-size:11px;margin-top:8px}.drop-zone{border:2px dashed #3b5878;background:#0b1628;border-radius:14px;padding:26px 18px;text-align:center;transition:.15s}.drop-zone.drag-over{border-color:var(--accent);background:#102a2b}.drop-zone strong{display:block;margin-bottom:5px}.drop-zone p{margin:0;color:var(--muted);font-size:12px}.export-actions{display:flex;gap:7px;flex-wrap:wrap}.file-chip{display:inline-flex;padding:6px 9px;border:1px solid #304565;border-radius:8px;background:#111d31;color:#b8c9de;font-size:11px;margin-top:10px;max-width:100%;overflow-wrap:anywhere}
 @media(max-width:900px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.layout{grid-template-columns:1fr}aside{display:flex;gap:5px;overflow:auto;padding:8px 12px;border-right:0;border-bottom:1px solid var(--line);position:sticky;top:70px;background:#0b1020;z-index:4}.nav-label{display:none}.nav{white-space:nowrap;width:auto;margin:0}.nav .ico{display:none}main{padding:22px 16px}}@media(max-width:560px){.topbar{padding:0 14px}.lan-tag{display:none}main{padding:18px 12px}.stats{gap:9px}.stat{padding:13px}.stat .value{font-size:23px}.page-head{align-items:flex-start;flex-direction:column}.card{padding:14px}.terminal-mount{height:52vh;min-height:300px}.terminal-output{height:320px}}
 </style>
 </head><body>
 <section id="login"><div class="login-card"><div class="brand"><div class="brand-mark">TS</div><div><h1>TermuxCodeSpace</h1><p>LOCAL ADMIN CONSOLE</p></div></div><h2>Admin sign in</h2><p class="muted" style="font-size:13px">Enter the randomly generated panel credential shown in Termux.</p><form id="loginForm"><label for="password">Admin credential</label><input id="password" type="password" autocomplete="current-password" required autofocus><button class="primary" type="submit">Unlock dashboard</button></form><div class="error" id="loginError"></div><div class="footer">Made By Aryan Giri | giriaryan694-a11y</div></div></section>
 <section id="app"><header class="topbar"><div class="brand"><div class="brand-mark">TS</div><div><h1>TermuxCodeSpace</h1><p>ADMIN CONSOLE</p></div></div><div class="top-right"><span class="lan-tag">● WI-FI LAN ONLY</span><button class="quiet small" id="logoutBtn">Sign out</button></div></header>
-<div class="layout"><aside><div class="nav-label">WORKSPACE</div><button class="nav active" data-page="overview"><span class="ico">◫</span>Overview</button><button class="nav" data-page="spaces"><span class="ico">▦</span>Codespaces</button><button class="nav" data-page="logs"><span class="ico">≋</span>Network logs</button><button class="nav" data-page="terminal"><span class="ico">›_</span>Terminal</button><div class="nav-label" style="margin-top:18px">SYSTEM</div><button class="nav" data-page="settings"><span class="ico">⚙</span>Settings</button></aside>
+<div class="layout"><aside><div class="nav-label">WORKSPACE</div><button class="nav active" data-page="overview"><span class="ico">◫</span>Overview</button><button class="nav" data-page="spaces"><span class="ico">▦</span>Codespaces</button><button class="nav" data-page="transfers"><span class="ico">⇅</span>Exports & imports</button><button class="nav" data-page="logs"><span class="ico">≋</span>Network logs</button><button class="nav" data-page="terminal"><span class="ico">›_</span>Terminal</button><div class="nav-label" style="margin-top:18px">SYSTEM</div><button class="nav" data-page="settings"><span class="ico">⚙</span>Settings</button></aside>
 <main>
 <div id="page-overview" class="page"><div class="page-head"><div><h2>Overview</h2><p>Manage your local codespaces from another device on the same Wi-Fi.</p></div><button class="primary" onclick="openCreate()">＋ New codespace</button></div><div class="notice">Panel access is restricted to this phone's Wi-Fi IP. Keep this credential private and use a trusted local network.</div><div class="stats"><div class="stat"><div class="label">Total codespaces</div><div class="value" id="statTotal">0</div><div class="sub">Managed environments</div></div><div class="stat"><div class="label">Running</div><div class="value" id="statRunning">0</div><div class="sub">Active code-server instances</div></div><div class="stat"><div class="label">Proxy enabled</div><div class="value" id="statProxy">0</div><div class="sub">Network logging available</div></div><div class="stat"><div class="label">Panel status</div><div class="value" style="font-size:20px;color:var(--accent)">ONLINE</div><div class="sub">Authenticated session</div></div></div><div class="card"><div class="card-head"><div><h3>Codespace activity</h3><p>Quick actions for your environments</p></div><button class="small" onclick="showPage('spaces')">View all →</button></div><div id="overviewSpaces"></div></div><div class="footer">Made By Aryan Giri | giriaryan694-a11y</div></div>
 <div id="page-spaces" class="page hidden"><div class="page-head"><div><h2>Codespaces</h2><p>Create, import, export, start, stop, delete, or rotate credentials.</p></div><div class="toolbar"><button onclick="openImport()">＋ Import codespace</button><button class="primary" onclick="openCreate()">＋ New codespace</button></div></div><div class="card"><div class="card-head"><h3>All environments</h3><button class="small" onclick="loadState()">↻ Refresh</button></div><div id="spacesTable" class="table-wrap"></div></div><div class="footer">Made By Aryan Giri | giriaryan694-a11y</div></div>
+<div id="page-transfers" class="page hidden"><div class="page-head"><div><h2>Exports & imports</h2><p>Track compression, uploads and extraction. Finished exports stay here until you remove them from Termux storage.</p></div><button class="small" onclick="refreshTransfers()">↻ Refresh</button></div>
+<div class="card"><div class="card-head"><div><h3>Active transfers</h3><p>Live progress from the phone and this browser</p></div></div><div id="activeTransfers" class="transfer-list"><div class="empty">No active transfers.</div></div></div>
+<div class="card"><div class="card-head"><div><h3>Import a codespace</h3><p>Choose an existing TermuxCodeSpace .tar.gz or .tgz archive, or drop it below.</p></div></div>
+<div id="importDropZone" class="drop-zone"><strong>Drop archive here</strong><p>or choose a file from this device</p><button type="button" class="small" onclick="document.getElementById('transferImportFile').click()">Choose archive</button><input id="transferImportFile" type="file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip" hidden><div id="selectedImportFile"></div></div>
+<div class="toolbar" style="margin-top:14px"><div class="field" style="flex:1"><label for="transferImportName">New codespace name</label><input id="transferImportName" maxlength="48" placeholder="my-imported-space" pattern="[A-Za-z0-9_-]+"></div><button class="primary" id="startImportBtn" type="button" onclick="importSpace()">Import archive</button></div>
+<p class="muted" style="font-size:12px;line-height:1.5;margin:12px 0 0">The archived codeserver password is preserved. Existing codespace names are never overwritten. Only import archives you trust.</p></div>
+<div class="card"><div class="card-head"><div><h3>Saved exports</h3><p>Archives are stored privately on the phone and can be downloaded again to this device.</p></div><button class="small danger" onclick="deleteAllExports()">Delete all exports</button></div><div id="savedExports" class="table-wrap"><div class="empty">No saved exports yet.</div></div></div><div class="footer">Made By Aryan Giri | giriary694-a11y</div></div>
 <div id="page-logs" class="page hidden"><div class="page-head"><div><h2>Network logs</h2><p>HTTP requests and HTTPS CONNECT domains recorded by each codespace proxy.</p></div><button class="small" onclick="loadLogs()">↻ Refresh</button></div><div class="card"><div class="toolbar"><div class="field" style="min-width:220px"><label for="logSpace">Codespace</label><select id="logSpace"></select></div><div class="field"><label for="logLimit">Lines</label><select id="logLimit"><option>100</option><option selected>250</option><option>500</option></select></div><div style="align-self:end"><span id="logProxyStatus" class="pill off">Proxy off</span></div></div><pre class="log-box" id="logOutput">Choose a codespace to view its network log.</pre></div><div class="footer">Logs are per-codespace and stored locally on the phone.</div></div>
 <div id="page-terminal" class="page hidden"><div class="page-head"><div><h2>Browser terminal</h2><p>Interactive PRoot shell with ANSI rendering, cursor control, resize, selection and terminal keyboard handling.</p></div></div><div class="notice warn">PRoot is a userspace environment, not a hardened security boundary. The browser terminal runs commands inside the selected codespace with its configured mounts.</div><div class="card"><div class="toolbar"><div class="field" style="min-width:230px"><label for="terminalSpace">Codespace</label><select id="terminalSpace"></select></div><button class="primary" id="terminalConnect">Connect terminal</button><button class="small danger" id="terminalDisconnect" disabled>Disconnect</button><span class="pill off" id="terminalStatus">Disconnected</span></div><div class="terminal" style="margin-top:14px"><div class="terminal-top"><span id="terminalLabel">No active session</span><span id="terminalTransportLabel">xterm.js · PTY</span></div><div id="terminalMount" class="terminal-mount" aria-label="Interactive shell terminal"></div><div class="terminal-keybar" aria-label="Mobile terminal keys"><button type="button" data-terminal-key="CTRL">CTRL</button><button type="button" data-terminal-key="ESC">ESC</button><button type="button" data-terminal-key="TAB">TAB</button><button type="button" data-terminal-key="UP">↑</button><button type="button" data-terminal-key="DOWN">↓</button><button type="button" data-terminal-key="LEFT">←</button><button type="button" data-terminal-key="RIGHT">→</button><button type="button" data-terminal-key="HOME">HOME</button><button type="button" data-terminal-key="END">END</button><button type="button" data-terminal-key="PGUP">PGUP</button><button type="button" data-terminal-key="PGDN">PGDN</button></div></div><p class="muted" style="font-size:12px;margin:10px 2px 0">Tip: tap the terminal to focus it. Select text to copy; use the browser context menu or Ctrl+Shift+V to paste. On mobile, use the extra-key bar for Ctrl, Tab and arrows.</p></div><div class="footer">Terminal sessions close when you disconnect, sign out or the panel server stops.</div></div>
 <div id="page-settings" class="page hidden"><div class="page-head"><div><h2>Settings & credentials</h2><p>Control access to this LAN admin panel.</p></div></div><div class="card"><div class="card-head"><div><h3>Admin credential</h3><p>Generate a new random credential and revoke the current one.</p></div><span class="pill on">Protected</span></div><p class="muted" style="font-size:13px;line-height:1.6">The credential is stored in Termux's private app data with restrictive file permissions. Rotating it invalidates existing browser sessions and terminal sessions.</p><button class="danger" id="revokeAdmin">Revoke & generate new credential</button></div><div class="card"><h3 style="margin:0 0 10px">Network & transport</h3><p class="muted" style="font-size:13px;line-height:1.7;margin:0">Choose the network interface and HTTP or HTTPS mode from the Termux menu when enabling this panel. HTTP is plaintext: credentials, session cookies and terminal traffic are not encrypted, so use it only on a trusted private home network. For HTTPS, the panel uses a loopback HTTP backend and the <a href="https://github.com/giriaryan694-a11y/http2https" target="_blank" rel="noopener noreferrer">http2https</a> reverse proxy for browser-facing TLS. Do not expose either port through router forwarding or public Wi-Fi.</p></div><div class="footer">Made By Aryan Giri | giriaryan694-a11y</div></div>
@@ -731,7 +742,8 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:1px solid
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" onerror="this.onerror=null;this.src='https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.js'"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" onerror="this.onerror=null;this.src='https://unpkg.com/@xterm/addon-fit@0.10.0/lib/addon-fit.js'"></script>
 <script>
-let csrf='',spaces=[],viewHosts=[],termId='',termCursor=0,pollTimer=null,logTimer=null;
+let csrf='',spaces=[],viewHosts=[],termId='',termCursor=0,pollTimer=null,logTimer=null,transferPollTimer=null;
+const autoDownloadExports=new Set(),startedDownloads=new Set(),startingDownloads=new Set(),localTransfers=new Map(),activeImportRequests=new Map();let serverTransferTasks=[];
 let terminal=null,fitAddon=null,terminalSocket=null,terminalTransport="none",terminalSendQueue=Promise.resolve(),terminalPendingInput="",terminalFlushTimer=null,terminalCtrlSticky=false,terminalManualClose=false,terminalResizeObserver=null;
 const $=id=>document.getElementById(id);
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -739,9 +751,9 @@ function toast(msg){$('toast').textContent=msg;$('toast').classList.remove('hidd
 function modal(title,body,buttons){$('modalContent').innerHTML=`<h3>${title}</h3>${body}<div class="modal-actions">${buttons}</div>`;$('modal').classList.remove('hidden')}
 function closeModal(){$('modal').classList.add('hidden')}
 async function api(path,options={}){const headers={'Content-Type':'application/json',...(options.headers||{})};if(csrf&&options.method&&options.method!=='GET')headers['X-CSRF-Token']=csrf;const res=await fetch(path,{credentials:'same-origin',...options,headers});let data={};try{data=await res.json()}catch{}if(res.status===401){showLogin();throw new Error(data.error||'Session expired')}if(!res.ok)throw new Error(data.error||`Request failed (${res.status})`);return data}
-function showLogin(){$('app').style.display='none';$('login').style.display='grid';csrf='';stopPolling();}
+function showLogin(){$('app').style.display='none';$('login').style.display='grid';csrf='';stopPolling();if(transferPollTimer){clearInterval(transferPollTimer);transferPollTimer=null;}}
 function showApp(){$('login').style.display='none';$('app').style.display='block';}
-function showPage(page){document.querySelectorAll('.page').forEach(p=>p.classList.add('hidden'));$('page-'+page).classList.remove('hidden');document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.page===page));if(page==='logs')loadLogs();if(page==='terminal')fillSpaceSelects();}
+function showPage(page){document.querySelectorAll('.page').forEach(p=>p.classList.add('hidden'));$('page-'+page).classList.remove('hidden');document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.page===page));if(page==='logs')loadLogs();if(page==='terminal')fillSpaceSelects();if(page==='transfers'){refreshTransfers();startTransferPolling();}}
 async function init(){try{const s=await api('/api/session');if(s.authenticated){csrf=s.csrf;showApp();await loadState()}else showLogin()}catch{showLogin()}}
 $('loginForm').addEventListener('submit',async e=>{e.preventDefault();$('loginError').textContent='';try{const d=await api('/api/login',{method:'POST',body:JSON.stringify({password:$('password').value})});csrf=d.csrf;$('password').value='';showApp();await loadState()}catch(err){$('loginError').textContent=err.message}});
 $('logoutBtn').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'})}catch{}showLogin()};
@@ -764,9 +776,22 @@ async function revealSpacePassword(name){try{const d=await api('/api/reveal-cred
 function showStoredSecret(title,secret){modal(title,`<p>This is the currently stored code-server/recovery-manager password for this codespace.</p><div class="secret" id="secretValue">${esc(secret)}</div><p class="muted">Keep it private. Revealing it does not rotate or change the credential.</p>`,`<button onclick="closeModal()">Close</button><button class="primary" onclick="copySecret()">Copy password</button>`)}
 async function deleteSpace(name){modal('Delete codespace',`<p>This permanently deletes <b>${esc(name)}</b> and its stored metadata. This cannot be undone.</p>`,`<button onclick="closeModal()">Cancel</button><button class="danger" onclick="confirmDelete('${esc(name)}')">Delete codespace</button>`)}
 async function confirmDelete(name){closeModal();try{await api('/api/action',{method:'POST',body:JSON.stringify({action:'delete',name})});await loadState();toast(`${name} deleted`)}catch(e){toast(e.message)}}
-function openImport(){modal('Import codespace',`<p>Import a TermuxCodeSpace <b>.tar.gz</b> or <b>.tgz</b> export. The archive includes the codespace filesystem and its code-server password. Only import archives you trust.</p><div class="field"><label>Archive file</label><input id="importFile" type="file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip"></div><div class="field"><label>New codespace name</label><input id="importName" maxlength="48" placeholder="my-imported-space" pattern="[A-Za-z0-9_-]+"></div><p class="muted">The original archived password is preserved. Existing codespace names cannot be overwritten.</p>`,`<button onclick="closeModal()">Cancel</button><button class="primary" onclick="importSpace()">Import archive</button>`);$('importFile').addEventListener('change',()=>{const f=$('importFile').files[0];if(f&&!$('importName').value){$('importName').value=f.name.replace(/\.(tar\.gz|tgz)$/i,'').replace(/[^A-Za-z0-9_-]/g,'-').slice(0,48)}})}
-async function importSpace(){const file=$('importFile').files[0],name=$('importName').value.trim();if(!file){toast('Choose an archive first');return}if(!/^[A-Za-z0-9_-]{1,48}$/.test(name)){toast('Use 1–48 letters, numbers, _ or -');return}closeModal();toast('Uploading and validating codespace archive…');try{const res=await fetch('/api/import',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/gzip','X-CSRF-Token':csrf,'X-Codespace-Name':name},body:file});let d={};try{d=await res.json()}catch{}if(res.status===401){showLogin();throw new Error(d.error||'Session expired')}if(!res.ok)throw new Error(d.error||`Import failed (${res.status})`);await loadState();toast(`${name} imported. Original password preserved.`)}catch(e){toast(e.message)}}
-async function downloadExport(name){if(!confirm(`Export ${name} as a private .tar.gz archive? The archive contains its code-server password.`))return;toast(`Preparing ${name} export…`);try{const res=await fetch('/api/export',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({name})});if(res.status===401){let d={};try{d=await res.json()}catch{}showLogin();throw new Error(d.error||'Session expired')}if(!res.ok){let d={};try{d=await res.json()}catch{}throw new Error(d.error||`Export failed (${res.status})`)}const blob=await res.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${name}.tar.gz`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);toast(`${name}.tar.gz downloaded. Store it privately.`)}catch(e){toast(e.message)}}
+function openImport(){showPage('transfers');$('transferImportFile').click()}
+function makeTransferId(){try{return Array.from(crypto.getRandomValues(new Uint8Array(12)),b=>b.toString(16).padStart(2,'0')).join('')}catch{return Date.now().toString(36)+Math.random().toString(36).slice(2,14)}}
+function formatBytes(n){n=Number(n)||0;if(n<1024)return `${n} B`;const units=['KB','MB','GB','TB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<units.length-1);return `${n.toFixed(n>=100?0:1)} ${units[i]}`}
+function setImportFile(file){if(!file)return;if(!/\.(tar\.gz|tgz)$/i.test(file.name)){toast('Choose a .tar.gz or .tgz archive');return}const input=$('transferImportFile');const dt=new DataTransfer();dt.items.add(file);input.files=dt.files;$('selectedImportFile').innerHTML=`<span class="file-chip">${esc(file.name)} · ${formatBytes(file.size)}</span>`;if(!$('transferImportName').value){$('transferImportName').value=file.name.replace(/\.(tar\.gz|tgz)$/i,'').replace(/[^A-Za-z0-9_-]/g,'-').slice(0,48)}}
+(function initImportDrop(){const zone=$('importDropZone');if(!zone)return;['dragenter','dragover'].forEach(ev=>zone.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();zone.classList.add('drag-over')}));['dragleave','dragend'].forEach(ev=>zone.addEventListener(ev,e=>{e.preventDefault();zone.classList.remove('drag-over')}));zone.addEventListener('drop',e=>{e.preventDefault();e.stopPropagation();zone.classList.remove('drag-over');setImportFile(e.dataTransfer.files&&e.dataTransfer.files[0])});$('transferImportFile').addEventListener('change',e=>setImportFile(e.target.files&&e.target.files[0]));})();
+function renderProgress(t){const hasPct=t.progress!==null&&t.progress!==undefined&&Number.isFinite(Number(t.progress));const pct=hasPct?Math.max(0,Math.min(100,Number(t.progress))):null;const detail=t.type==='export'&&t.stage==='compressing'?`${esc(t.stage_label||'Compressing archive')} · ${formatBytes(t.bytes_written||0)} written`:t.type==='download'&&t.bytes_total?`${formatBytes(t.bytes_done||0)} / ${formatBytes(t.bytes_total)}`:t.type==='import'&&t.bytes_total&&t.stage==='uploading'?`${formatBytes(t.bytes_done||0)} / ${formatBytes(t.bytes_total)}`:t.type==='import'&&t.extract_total?`${formatBytes(t.extract_done||0)} / ${formatBytes(t.extract_total)} extracted`:esc(t.stage_label||t.stage||'Working');const active=['running','queued'].includes(t.status);const cancelLabel=t.type==='export'?'Stop':'Cancel';const controls=active&&(t.type==='export'||t.type==='import')?`<button class="small danger" onclick="cancelTransfer('${esc(t.id)}','${esc(t.type)}')">${cancelLabel}</button>`:'';const pill=t.status==='complete'?'on':['failed','cancelled'].includes(t.status)?'warn':'off';return `<div class="transfer-item"><div class="transfer-top"><div class="transfer-name">${esc(t.name||'Transfer')} · ${esc(t.type||'job')}</div><div style="display:flex;align-items:center;gap:8px"><span class="pill ${pill}">${esc(t.status||'running')}</span>${controls}</div></div><div class="transfer-detail">${detail}${t.error?` · ${esc(t.error)}`:''}</div><div class="progress-track"><div class="progress-fill ${pct===null?'indeterminate':''}" ${pct===null?'':`style="width:${pct}%"`}></div></div><div class="progress-meta"><span>${esc(t.stage_label||t.stage||'Working')}</span><span>${pct===null?'In progress':`${Math.round(pct)}%`}</span></div></div>`}
+function renderActiveTransfers(){const activeMap=new Map(serverTransferTasks.filter(t=>['running','queued','cancelling','failed','cancelled'].includes(t.status)).map(t=>[t.id,t]));for(const [id,t] of localTransfers)activeMap.set(id,t);const active=Array.from(activeMap.values());$('activeTransfers').innerHTML=active.length?active.map(renderProgress).join(''):'<div class=\"empty\">No active transfers.</div>'}
+async function refreshTransfers(){try{const d=await api('/api/transfers');const tasks=d.tasks||[],exports=d.exports||[];serverTransferTasks=tasks;for(const t of tasks){if(t.type==='download'&&(t.status==='complete'||t.status==='failed')&&t.export_id)startingDownloads.delete(t.export_id)}renderActiveTransfers();const rows=exports.filter(x=>x.status==='complete'||x.status==='failed').map(x=>`<tr><td><div class=\"space-name\">${esc(x.name)}</div><div class=\"space-port\">${esc(x.created_label||'Saved archive')} · ${x.status==='complete'?formatBytes(x.size_bytes||0):esc(x.error||'Export interrupted')}</div></td><td><span class=\"pill ${x.status==='complete'?'on':'warn'}\">${x.status==='complete'?'Ready':'Failed'}</span></td><td><div class=\"export-actions\">${x.status==='complete'?`<button class=\"small primary\" onclick=\"downloadSavedExport('${esc(x.id)}','${esc(x.name)}')\">↓ Download</button>`:'<span class=\"muted\">Run export again</span>'}</div></td></tr>`).join('');$('savedExports').innerHTML=rows?`<table><thead><tr><th>Codespace archive</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`:'<div class=\"empty\">No completed exports yet. Export a codespace to keep a downloadable archive here.</div>';for(const t of tasks){if(t.type==='export'&&t.status==='complete'&&autoDownloadExports.has(t.id)&&!startedDownloads.has(t.id)){autoDownloadExports.delete(t.id);startedDownloads.add(t.id);downloadSavedExport(t.id,t.name)}}const transferBusy=tasks.some(t=>t.status==='running'||t.status==='queued')||autoDownloadExports.size||startingDownloads.size||localTransfers.size;const transferPageOpen=!$('page-transfers').classList.contains('hidden');if(!transferBusy&&!transferPageOpen&&transferPollTimer){clearInterval(transferPollTimer);transferPollTimer=null}}catch(e){if(!String(e.message).includes('Session expired'))toast(e.message)}}
+function startTransferPolling(){if(!transferPollTimer)transferPollTimer=setInterval(refreshTransfers,1000)}
+async function importSpace(){const file=$('transferImportFile').files[0],name=$('transferImportName').value.trim();if(!file){toast('Choose or drop an archive first');return}if(!/^[A-Za-z0-9_-]{1,48}$/.test(name)){toast('Use 1–48 letters, numbers, _ or -');return}const id=makeTransferId(),xhr=new XMLHttpRequest();const local={id,type:'import',name,status:'running',stage:'uploading',stage_label:'Uploading archive',progress:0,bytes_done:0,bytes_total:file.size,cancelRequested:false,xhr};localTransfers.set(id,local);activeImportRequests.set(id,xhr);startTransferPolling();$('startImportBtn').disabled=true;refreshTransfers();xhr.open('POST','/api/import');xhr.withCredentials=true;xhr.setRequestHeader('Content-Type','application/gzip');xhr.setRequestHeader('X-CSRF-Token',csrf);xhr.setRequestHeader('X-Codespace-Name',name);xhr.setRequestHeader('X-Transfer-ID',id);xhr.upload.onprogress=e=>{if(e.lengthComputable){local.progress=Math.round(e.loaded/e.total*60);local.bytes_done=e.loaded;local.bytes_total=e.total;local.stage='uploading';local.stage_label='Uploading archive';refreshLocalTransferView()}};xhr.upload.onload=()=>{localTransfers.delete(id);refreshTransfers()};xhr.onload=async()=>{let d={};try{d=JSON.parse(xhr.responseText||'{}')}catch{}localTransfers.delete(id);activeImportRequests.delete(id);$('startImportBtn').disabled=false;if(xhr.status===401){showLogin();toast(d.error||'Session expired');return}if(xhr.status<200||xhr.status>=300){toast(d.error||`Import failed (${xhr.status})`);refreshTransfers();return}await loadState();await refreshTransfers();$('transferImportFile').value='';$('transferImportName').value='';$('selectedImportFile').innerHTML='';toast(`${name} imported. Original password preserved.`)};xhr.onerror=()=>{localTransfers.delete(id);activeImportRequests.delete(id);$('startImportBtn').disabled=false;toast('Import connection failed. Check the network and refresh transfer status.');refreshTransfers()};xhr.onabort=()=>{localTransfers.delete(id);activeImportRequests.delete(id);$('startImportBtn').disabled=false;toast(local.cancelRequested?'Import cancellation requested.':'Import upload was aborted.');refreshTransfers()};xhr.send(file)}
+async function cancelTransfer(id,type){const label=type==='export'?'Stop this export?':'Cancel this import?';const detail=type==='export'?'The partial archive will be removed. A previously running codespace will be restarted when possible.':'The upload/extraction will stop and temporary files will be removed.';if(!confirm(`${label}\n\n${detail}`))return;try{await api('/api/transfer/cancel',{method:'POST',body:JSON.stringify({id})});const local=localTransfers.get(id);if(local){local.cancelRequested=true;local.status='cancelling';local.stage_label='Cancellation requested'}const xhr=activeImportRequests.get(id);if(xhr){try{xhr.abort()}catch{}activeImportRequests.delete(id)}refreshLocalTransferView();startTransferPolling();await refreshTransfers();toast(type==='export'?'Export stop requested.':'Import cancellation requested.')}catch(e){toast(e.message)}}
+async function deleteAllExports(){if(!confirm('Permanently delete all saved export archives from phone storage? Active exports will be left alone. This cannot be undone.'))return;try{const d=await api('/api/exports/delete-all',{method:'POST',body:'{}'});await refreshTransfers();toast(`Deleted ${d.deleted||0} saved export(s), freed ${formatBytes(d.bytes_freed||0)}.`)}catch(e){toast(e.message)}}
+function refreshLocalTransferView(){renderActiveTransfers()}
+async function downloadExport(name){if(!confirm(`Export ${name} as a private .tar.gz archive? It contains the codespace filesystem and code-server password.`))return;try{const d=await api('/api/export',{method:'POST',body:JSON.stringify({name})});if(d.id)autoDownloadExports.add(d.id);showPage('transfers');startTransferPolling();await refreshTransfers();toast(`Export queued for ${name}. It will download automatically when compression finishes.`)}catch(e){toast(e.message)}}
+function downloadSavedExport(id,name){if(startingDownloads.has(id))return;startingDownloads.add(id);const transferId=makeTransferId(),url=`/api/exports/download?id=${encodeURIComponent(id)}&transfer_id=${encodeURIComponent(transferId)}`;const a=document.createElement('a');a.href=url;a.download=`${name}.tar.gz`;a.style.display='none';document.body.appendChild(a);a.click();a.remove();startTransferPolling();refreshTransfers();setTimeout(()=>startingDownloads.delete(id),120000)}
+
 function openCreate(){modal('Create codespace',`<div class="field"><label>Name</label><input id="newName" maxlength="48" placeholder="my-project" pattern="[A-Za-z0-9_-]+"></div><div class="field"><label>Storage quota (MB, 0 = unlimited)</label><input id="newQuota" type="number" min="0" max="100000" value="0"></div><p>A fresh Ubuntu clone will be created and started automatically. The generated code-server credential is shown once.</p>`,`<button onclick="closeModal()">Cancel</button><button class="primary" onclick="createSpace()">Create & start</button>`)}
 async function createSpace(){const name=$('newName').value.trim(),quota=Number($('newQuota').value||0);if(!/^[A-Za-z0-9_-]{1,48}$/.test(name)){toast('Use 1–48 letters, numbers, _ or -');return}if(!Number.isInteger(quota)||quota<0||quota>100000){toast('Invalid quota');return}closeModal();toast('Creating and starting codespace…');try{const d=await api('/api/action',{method:'POST',body:JSON.stringify({action:'create',name,quota})});await loadState();showSecret(`${name} created`,d.password,`Code-server URL: http://${location.hostname}:${d.port}\nSave this credential. It is stored privately on the phone.`)}catch(e){toast(e.message)}}
 function showSecret(title,secret,description){modal(title,`<p>${esc(description).replace(/\n/g,'<br>')}</p><div class="secret" id="secretValue">${esc(secret)}</div><p class="muted">Copy this now. The old credential has been revoked.</p>`,`<button onclick="closeModal()">Close</button><button class="primary" onclick="copySecret()">Copy credential</button>`)}
@@ -828,6 +853,375 @@ class PanelState:
         self.terminals = {}
         self.lock = threading.RLock()
         self.archive_lock = threading.Lock()
+        self.transfer_tasks = {}
+        self.transfer_controls = {}
+        self.export_dir = self.base / "admin-exports"
+        self.export_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(self.export_dir, 0o700)
+        except OSError:
+            pass
+
+    def add_transfer(self, task):
+        transfer_id = str(task.get("id", ""))
+        with self.lock:
+            self.transfer_tasks[transfer_id] = task
+            if task.get("type") in {"export", "import"}:
+                self.transfer_controls[transfer_id] = {"cancel": threading.Event(), "process": None, "socket": None}
+            if len(self.transfer_tasks) > 120:
+                finished = sorted((item for item in self.transfer_tasks.values() if item.get("status") not in {"running", "queued", "cancelling"}), key=lambda item: float(item.get("updated", item.get("created", 0))))
+                for item in finished[:max(0, len(self.transfer_tasks) - 90)]:
+                    old_id = str(item.get("id", ""))
+                    self.transfer_tasks.pop(old_id, None)
+                    self.transfer_controls.pop(old_id, None)
+
+    def transfer_cancelled(self, transfer_id):
+        with self.lock:
+            control = self.transfer_controls.get(transfer_id)
+            return bool(control and control["cancel"].is_set())
+
+    def check_transfer_cancelled(self, transfer_id):
+        if self.transfer_cancelled(transfer_id):
+            raise TransferCancelled("Transfer cancelled by user")
+
+    def set_transfer_socket(self, transfer_id, sock):
+        with self.lock:
+            control = self.transfer_controls.get(transfer_id)
+            if control:
+                control["socket"] = sock
+                cancelled = control["cancel"].is_set()
+            else:
+                cancelled = False
+        if cancelled and sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def set_transfer_process(self, transfer_id, proc):
+        with self.lock:
+            control = self.transfer_controls.get(transfer_id)
+            if control:
+                control["process"] = proc
+                cancelled = control["cancel"].is_set()
+            else:
+                cancelled = False
+        if cancelled:
+            self.terminate_process(proc)
+
+    def clear_transfer_process(self, transfer_id, proc=None):
+        with self.lock:
+            control = self.transfer_controls.get(transfer_id)
+            if control and (proc is None or control.get("process") is proc):
+                control["process"] = None
+
+    def remove_transfer_control(self, transfer_id):
+        with self.lock:
+            self.transfer_controls.pop(transfer_id, None)
+
+    @staticmethod
+    def terminate_process(proc):
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def cancel_transfer(self, transfer_id):
+        with self.lock:
+            task = self.transfer_tasks.get(transfer_id)
+            control = self.transfer_controls.get(transfer_id)
+            if not task or not control:
+                return False, "Transfer is no longer active"
+            if task.get("type") not in {"export", "import"}:
+                return False, "This transfer cannot be cancelled here"
+            if task.get("status") not in {"running", "queued", "cancelling"}:
+                return False, "Transfer has already finished"
+            control["cancel"].set()
+            proc = control.get("process")
+            sock = control.get("socket")
+            task.update({"status": "cancelling", "stage": "cancelling", "stage_label": "Cancellation requested", "updated": time.time()})
+            snapshot = dict(task)
+        if snapshot.get("type") == "export":
+            self.save_export_meta(snapshot)
+        if proc:
+            self.terminate_process(proc)
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+        return True, "Cancellation requested"
+
+    def import_name_reserved(self, name):
+        with self.lock:
+            return any(task.get("type") == "import" and task.get("name") == name and task.get("status") in {"running", "queued", "cancelling"}
+                       for task in self.transfer_tasks.values())
+
+    def import_name_available(self, name):
+        if (self.spaces / name).exists() or (self.spaces / name).is_symlink():
+            return False
+        try:
+            return not any(self.meta.glob(name + ".*"))
+        except OSError:
+            return False
+
+    def cleanup_partial_import(self, name):
+        target = self.spaces / name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.is_symlink():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        try:
+            for path in self.meta.glob(name + ".*"):
+                try:
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        image = self.base / "quota_images" / (name + ".img")
+        try:
+            image.unlink()
+        except OSError:
+            pass
+
+    def run_action_for_transfer(self, transfer_id, action, *values, timeout=3600):
+        command = ["bash", self.script, "--admin-action", action, *[str(x) for x in values]]
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+            proc = subprocess.Popen(command, stdout=log, stderr=log, text=True, env=os.environ.copy(), start_new_session=True)
+            self.set_transfer_process(transfer_id, proc)
+            started = time.time()
+            try:
+                while proc.poll() is None:
+                    self.check_transfer_cancelled(transfer_id)
+                    if time.time() - started > timeout:
+                        self.terminate_process(proc)
+                        raise RuntimeError("Import finalization timed out")
+                    time.sleep(0.2)
+                self.check_transfer_cancelled(transfer_id)
+                if proc.returncode != 0:
+                    log.seek(0, 2)
+                    end = log.tell()
+                    log.seek(max(0, end - 2400))
+                    detail = log.read().strip() or "No details returned by the import process."
+                    raise RuntimeError(detail[-1800:])
+            finally:
+                self.clear_transfer_process(transfer_id, proc)
+
+    def update_transfer(self, transfer_id, **updates):
+        with self.lock:
+            task = self.transfer_tasks.get(transfer_id)
+            if not task:
+                return
+            task.update(updates)
+            task["updated"] = time.time()
+            snapshot = dict(task)
+        if snapshot.get("type") == "export":
+            self.save_export_meta(snapshot)
+
+    def complete_transfer(self, transfer_id, **updates):
+        with self.lock:
+            control = self.transfer_controls.get(transfer_id)
+            if control and control["cancel"].is_set():
+                raise TransferCancelled("Transfer cancelled by user")
+            task = self.transfer_tasks.get(transfer_id)
+            if not task:
+                raise RuntimeError("Transfer record no longer exists")
+            task.update(updates)
+            task["updated"] = time.time()
+            snapshot = dict(task)
+        if snapshot.get("type") == "export":
+            self.save_export_meta(snapshot)
+
+    def save_export_meta(self, task):
+        export_id = str(task.get("id", ""))
+        if not re.fullmatch(r"[a-f0-9]{24}", export_id):
+            return
+        target = self.export_dir / (export_id + ".json")
+        temporary = self.export_dir / (export_id + ".json.tmp")
+        safe = {key: task.get(key) for key in ("id", "type", "name", "filename", "status", "stage", "stage_label", "created", "updated", "progress", "size_bytes", "bytes_written", "error")}
+        try:
+            with temporary.open("w", encoding="utf-8") as fp:
+                json.dump(safe, fp, ensure_ascii=False)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        except OSError:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    def list_exports(self):
+        items = []
+        with self.lock:
+            active_ids = {str(key) for key, task in self.transfer_tasks.items() if task.get("type") == "export" and task.get("status") in {"running", "queued", "cancelling"}}
+        try:
+            paths = sorted(self.export_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return items
+        for meta_path in paths[:100]:
+            try:
+                if meta_path.is_symlink():
+                    continue
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                export_id = str(data.get("id", ""))
+                if not re.fullmatch(r"[a-f0-9]{24}", export_id):
+                    continue
+                archive = self.export_dir / (export_id + ".tar.gz")
+                if data.get("status") == "complete" and (not archive.is_file() or archive.is_symlink()):
+                    continue
+                if data.get("status") in {"running", "cancelling"} and export_id not in active_ids:
+                    data["status"] = "failed"
+                    data["stage"] = "interrupted"
+                    data["stage_label"] = "Panel restarted before export finished"
+                    data["error"] = "Incomplete export removed or interrupted"
+                    try:
+                        archive.unlink()
+                    except OSError:
+                        pass
+                    self.save_export_meta(data)
+                data["created_label"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(data.get("created", 0))))
+                if archive.is_file():
+                    data["size_bytes"] = archive.stat().st_size
+                items.append(data)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return items
+
+    def delete_all_exports(self):
+        with self.lock:
+            active_ids = {str(key) for key, task in self.transfer_tasks.items()
+                          if task.get("type") == "export" and task.get("status") in {"running", "queued", "cancelling"}}
+        deleted = 0
+        bytes_freed = 0
+        try:
+            paths = list(self.export_dir.iterdir())
+        except OSError:
+            return {"deleted": 0, "bytes_freed": 0}
+        for path in paths:
+            match = re.fullmatch(r"([a-f0-9]{24})(?:\.tar\.gz|\.json(?:\.tmp)?)", path.name)
+            if not match or match.group(1) in active_ids:
+                continue
+            try:
+                if path.is_symlink():
+                    path.unlink()
+                elif path.is_file():
+                    if path.name.endswith(".tar.gz"):
+                        bytes_freed += path.stat().st_size
+                    path.unlink()
+                else:
+                    continue
+                if path.name.endswith(".tar.gz"):
+                    deleted += 1
+            except OSError:
+                continue
+        return {"deleted": deleted, "bytes_freed": bytes_freed}
+
+    def run_export_job(self, transfer_id, name, archive, filename):
+        archive = Path(archive)
+        proc = None
+        was_running = False
+        try:
+            was_running = bool(self.space_state(name).get("running"))
+            self.check_transfer_cancelled(transfer_id)
+            self.update_transfer(transfer_id, stage="preparing", stage_label="Stopping codespace for a consistent archive", progress=3)
+            self.close_space_terminals(name)
+            self.check_transfer_cancelled(transfer_id)
+            self.update_transfer(transfer_id, stage="compressing", stage_label="Compressing codespace", progress=None)
+            command = ["bash", self.script, "--admin-action", "export", name, str(archive)]
+            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+                try:
+                    proc = subprocess.Popen(command, stdout=log, stderr=log, text=True, env=os.environ.copy(), start_new_session=True)
+                except OSError as exc:
+                    raise RuntimeError(str(exc))
+                self.set_transfer_process(transfer_id, proc)
+                started = time.time()
+                last_size = -1
+                while proc.poll() is None:
+                    self.check_transfer_cancelled(transfer_id)
+                    if time.time() - started > 3600:
+                        self.terminate_process(proc)
+                        raise RuntimeError("Export timed out. Check Termux storage and logs.")
+                    try:
+                        size = archive.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size != last_size:
+                        self.update_transfer(transfer_id, bytes_written=size)
+                        last_size = size
+                    time.sleep(0.25)
+                self.check_transfer_cancelled(transfer_id)
+                code = proc.returncode
+                try:
+                    size = archive.stat().st_size
+                except OSError:
+                    size = 0
+                if code != 0 or size <= 0:
+                    log.seek(0, 2)
+                    end = log.tell()
+                    log.seek(max(0, end - 2400))
+                    detail = log.read().strip() or "No details returned by the export process."
+                    raise RuntimeError(detail[-1800:])
+            self.check_transfer_cancelled(transfer_id)
+            try:
+                os.chmod(archive, 0o600)
+            except OSError:
+                pass
+            self.complete_transfer(transfer_id, status="complete", stage="complete", stage_label="Export ready · downloading to this device", progress=100, size_bytes=size, bytes_written=size, filename=filename, error="")
+        except TransferCancelled:
+            if proc and proc.poll() is None:
+                self.terminate_process(proc)
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+            if was_running:
+                try:
+                    # The CLI export stops a running codespace before archiving it.
+                    # A forced cancellation can interrupt that action before its restart step.
+                    state = self.space_state(name)
+                    if not state.get("running"):
+                        self.run_action("start", name, timeout=240)
+                except Exception as restart_error:
+                    self.update_transfer(transfer_id, error=("Export cancelled; restart attempt failed: " + str(restart_error))[:700])
+            self.update_transfer(transfer_id, status="cancelled", stage="cancelled", stage_label="Export stopped · partial archive removed", progress=None)
+        except Exception as exc:
+            if proc and proc.poll() is None:
+                self.terminate_process(proc)
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+            self.update_transfer(transfer_id, status="failed", stage="failed", stage_label="Export failed", error=str(exc)[:700])
+        finally:
+            self.clear_transfer_process(transfer_id, proc)
+            self.remove_transfer_control(transfer_id)
+            self.archive_lock.release()
 
     def valid_name(self, name):
         return bool(NAME_RE.fullmatch(str(name or ""))) and (self.spaces / str(name)).is_dir()
@@ -954,12 +1348,16 @@ def _ensure_real_directories(root, parts):
     return current
 
 
-def extract_codespace_archive(archive_path, staging_dir):
+def extract_codespace_archive(archive_path, staging_dir, progress_callback=None, cancel_check=None):
     """Validate and extract the existing CLI .tar.gz format without following archive symlinks."""
     staging_dir = Path(staging_dir)
+    if cancel_check:
+        cancel_check()
     staging_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     with tarfile.open(archive_path, mode="r:gz") as tf:
         members = tf.getmembers()
+        if cancel_check:
+            cancel_check()
         if not members or len(members) > MAX_ARCHIVE_MEMBERS:
             raise ValueError("Archive is empty or contains too many entries")
         normalized = []
@@ -968,6 +1366,8 @@ def extract_codespace_archive(archive_path, staging_dir):
         metadata_member = None
         total_size = 0
         for member in members:
+            if cancel_check:
+                cancel_check()
             rel = _archive_relpath(member.name)
             if rel in seen:
                 raise ValueError("Archive contains duplicate paths")
@@ -1016,8 +1416,11 @@ def extract_codespace_archive(archive_path, staging_dir):
         meta_path = staging_dir / "codespace.meta"
         meta_path.write_bytes(metadata_raw)
         hardlinks = []
+        extracted_size = 0
         directory_modes = [(root_dir, 0o755)]
         for member, rel in normalized:
+            if cancel_check:
+                cancel_check()
             if rel == "codespace.meta":
                 continue
             parts = rel.split("/")
@@ -1057,12 +1460,23 @@ def extract_codespace_archive(archive_path, staging_dir):
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
                 fd = os.open(str(target), flags, member.mode & 0o777 or 0o600)
                 with os.fdopen(fd, "wb") as out:
-                    shutil.copyfileobj(source, out, length=1024 * 1024)
+                    while True:
+                        if cancel_check:
+                            cancel_check()
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        extracted_size += len(chunk)
+                        if progress_callback:
+                            progress_callback(extracted_size, total_size)
                 try:
                     os.chmod(target, member.mode & 0o777)
                 except OSError:
                     pass
         for target, link_rel in hardlinks:
+            if cancel_check:
+                cancel_check()
             source_parts = link_rel.split("/")[1:]
             source_parent = _ensure_real_directories(root_dir, source_parts[:-1])
             source = source_parent / source_parts[-1]
@@ -1378,6 +1792,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         name = self.headers.get("X-Codespace-Name", "").strip()
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        transfer_id = self.headers.get("X-Transfer-ID", "")
+        if not re.fullmatch(r"[a-f0-9]{24}", transfer_id):
+            transfer_id = secrets.token_hex(12)
         if not NAME_RE.fullmatch(name):
             self.send_json(400, {"error": "Choose a name using 1–48 letters, numbers, underscores or hyphens."})
             return
@@ -1391,41 +1808,86 @@ class Handler(BaseHTTPRequestHandler):
         if size <= 0 or size > MAX_IMPORT_BYTES:
             self.send_json(413, {"error": "Archive size is invalid or exceeds the 4 GiB upload limit."})
             return
-        if (STATE.spaces / name).exists():
-            self.send_json(409, {"error": "A codespace with that name already exists."})
+        if not STATE.import_name_available(name):
+            self.send_json(409, {"error": "A codespace or saved metadata with that name already exists."})
             return
         if not STATE.archive_lock.acquire(blocking=False):
             self.send_json(409, {"error": "Another import or export is already running."})
             return
         temp_dir = None
+        STATE.add_transfer({"id": transfer_id, "type": "import", "name": name, "status": "running", "stage": "uploading", "stage_label": "Uploading archive", "progress": 0, "bytes_done": 0, "bytes_total": size, "created": time.time(), "updated": time.time()})
+        STATE.set_transfer_socket(transfer_id, self.connection)
         try:
+            STATE.check_transfer_cancelled(transfer_id)
             free = shutil.disk_usage(STATE.base).free
             if size > free - 64 * 1024 * 1024:
-                self.send_json(413, {"error": "Not enough free storage for this upload."})
-                return
+                raise ValueError("Not enough free storage for this upload.")
             temp_dir = Path(tempfile.mkdtemp(prefix=".admin-import-", dir=str(STATE.base)))
             archive = temp_dir / "upload.tar.gz"
             remaining = size
+            uploaded = 0
             self.connection.settimeout(300)
             with archive.open("xb") as output:
                 while remaining:
+                    STATE.check_transfer_cancelled(transfer_id)
                     chunk = self.rfile.read(min(1024 * 1024, remaining))
                     if not chunk:
+                        STATE.check_transfer_cancelled(transfer_id)
                         raise ValueError("Upload ended before the full archive arrived")
                     output.write(chunk)
+                    uploaded += len(chunk)
                     remaining -= len(chunk)
-            original_name, metadata = extract_codespace_archive(archive, temp_dir / "extract")
-            if (STATE.spaces / name).exists():
+                    STATE.update_transfer(transfer_id, bytes_done=uploaded, progress=min(60, int(uploaded * 60 / size)), stage="uploading", stage_label="Uploading archive")
+            STATE.set_transfer_socket(transfer_id, None)
+            STATE.check_transfer_cancelled(transfer_id)
+            STATE.update_transfer(transfer_id, stage="validating", stage_label="Validating archive", progress=63)
+            def extraction_progress(done, total):
+                STATE.check_transfer_cancelled(transfer_id)
+                pct = 92 if total <= 0 else 64 + int(28 * min(1, done / total))
+                STATE.update_transfer(transfer_id, stage="extracting", stage_label="Validating and extracting files", progress=pct, extract_done=done, extract_total=total)
+            original_name, metadata = extract_codespace_archive(archive, temp_dir / "extract", extraction_progress, lambda: STATE.check_transfer_cancelled(transfer_id))
+            STATE.check_transfer_cancelled(transfer_id)
+            if not STATE.import_name_available(name):
                 raise ValueError("A codespace with that name already exists.")
-            STATE.run_action("import-staged", str(temp_dir / "extract"), name, timeout=3600)
+            STATE.update_transfer(transfer_id, stage="finalizing", stage_label="Finalizing imported codespace", progress=95)
+            STATE.run_action_for_transfer(transfer_id, "import-staged", str(temp_dir / "extract"), name, timeout=3600)
+            STATE.check_transfer_cancelled(transfer_id)
             port_file = STATE.meta / f"{name}.port"
             port = port_file.read_text(encoding="utf-8").strip() if port_file.exists() else ""
-            self.send_json(200, {"ok": True, "name": name, "original_name": original_name, "port": port, "message": "Codespace imported. Its archived password was preserved."})
-        except (OSError, ValueError, tarfile.TarError, RuntimeError, UnicodeError, EOFError, zlib.error) as exc:
-            self.send_json(400, {"error": str(exc)[:700]})
+            STATE.complete_transfer(transfer_id, status="complete", stage="complete", stage_label="Import complete", progress=100, bytes_done=size)
+            try:
+                self.send_json(200, {"ok": True, "name": name, "original_name": original_name, "port": port, "message": "Codespace imported. Its archived password was preserved."})
+            except OSError:
+                pass
+        except (TransferCancelled, OSError, ValueError, tarfile.TarError, RuntimeError, UnicodeError, EOFError, zlib.error) as exc:
+            if STATE.transfer_cancelled(transfer_id) or isinstance(exc, TransferCancelled):
+                with STATE.lock:
+                    current_task = STATE.transfer_tasks.get(transfer_id, {})
+                    finalization_started = current_task.get("stage") == "finalizing"
+                if finalization_started:
+                    STATE.cleanup_partial_import(name)
+                STATE.update_transfer(transfer_id, status="cancelled", stage="cancelled", stage_label="Import cancelled · temporary files removed", error="")
+                try:
+                    self.send_json(409, {"error": "Import cancelled"})
+                except OSError:
+                    pass
+            else:
+                with STATE.lock:
+                    current_task = STATE.transfer_tasks.get(transfer_id, {})
+                    finalization_started = current_task.get("stage") == "finalizing"
+                if finalization_started:
+                    STATE.cleanup_partial_import(name)
+                STATE.update_transfer(transfer_id, status="failed", stage="failed", stage_label="Import failed", error=str(exc)[:700])
+                try:
+                    self.send_json(400, {"error": str(exc)[:700]})
+                except OSError:
+                    pass
         finally:
+            STATE.set_transfer_socket(transfer_id, None)
+            STATE.clear_transfer_process(transfer_id)
             if temp_dir is not None:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+            STATE.remove_transfer_control(transfer_id)
             STATE.archive_lock.release()
 
     def do_GET(self):
@@ -1449,6 +1911,56 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/state":
             spaces = [STATE.space_state(n) for n in STATE.names()]
             self.send_json(200, {"spaces": spaces, "view_hosts": STATE.view_hosts})
+            return
+        if parsed.path == "/api/transfers":
+            with STATE.lock:
+                tasks = [dict(task) for task in STATE.transfer_tasks.values()]
+            tasks.sort(key=lambda item: float(item.get("created", 0)), reverse=True)
+            self.send_json(200, {"tasks": tasks[:60], "exports": STATE.list_exports()})
+            return
+        if parsed.path == "/api/exports/download":
+            q = urllib.parse.parse_qs(parsed.query)
+            export_id = (q.get("id") or [""])[0]
+            transfer_id = (q.get("transfer_id") or [""])[0]
+            if not re.fullmatch(r"[a-f0-9]{24}", export_id) or not re.fullmatch(r"[a-f0-9]{24}", transfer_id):
+                self.send_json(400, {"error": "Invalid export or transfer identifier"})
+                return
+            archive = STATE.export_dir / (export_id + ".tar.gz")
+            try:
+                meta = json.loads((STATE.export_dir / (export_id + ".json")).read_text(encoding="utf-8"))
+                if meta.get("status") != "complete" or not archive.is_file() or archive.is_symlink():
+                    raise FileNotFoundError
+                size = archive.stat().st_size
+                name = str(meta.get("name", "codespace"))
+                if not NAME_RE.fullmatch(name):
+                    raise FileNotFoundError
+            except FileNotFoundError:
+                self.send_json(404, {"error": "Saved export not found"})
+                return
+            except (OSError, ValueError, json.JSONDecodeError):
+                self.send_json(500, {"error": "Could not read saved export"})
+                return
+            task = {"id": transfer_id, "type": "download", "export_id": export_id, "name": name, "status": "running", "stage": "downloading", "stage_label": "Sending archive to browser", "progress": 0, "bytes_done": 0, "bytes_total": size, "created": time.time(), "updated": time.time()}
+            STATE.add_transfer(task)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{name}.tar.gz"')
+            self.security_headers()
+            self.end_headers()
+            sent = 0
+            try:
+                with archive.open("rb") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+                        STATE.update_transfer(transfer_id, bytes_done=sent, progress=min(99, int(sent * 100 / size)), stage="downloading", stage_label="Sending archive to browser")
+                STATE.update_transfer(transfer_id, status="complete", stage="complete", stage_label="Download sent to browser", progress=100, bytes_done=size)
+            except (OSError, BrokenPipeError) as exc:
+                STATE.update_transfer(transfer_id, status="failed", stage="failed", stage_label="Browser download interrupted", error=str(exc)[:300])
             return
         if parsed.path == "/api/policy":
             q = urllib.parse.parse_qs(parsed.query)
@@ -1563,6 +2075,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(403, {"error": "Invalid CSRF token"})
             return
 
+        if parsed.path == "/api/transfer/cancel":
+            transfer_id = str(body.get("id", ""))
+            if not re.fullmatch(r"[a-f0-9]{24}", transfer_id):
+                self.send_json(400, {"error": "Invalid transfer identifier"})
+                return
+            ok, message = STATE.cancel_transfer(transfer_id)
+            if not ok:
+                self.send_json(409, {"error": message})
+                return
+            self.send_json(202, {"ok": True, "id": transfer_id, "status": "cancelling", "message": message})
+            return
+
+        if parsed.path == "/api/exports/delete-all":
+            result = STATE.delete_all_exports()
+            self.send_json(200, {"ok": True, **result})
+            return
+
         if parsed.path == "/api/export":
             name = str(body.get("name", ""))
             if not STATE.valid_name(name):
@@ -1571,41 +2100,15 @@ class Handler(BaseHTTPRequestHandler):
             if not STATE.archive_lock.acquire(blocking=False):
                 self.send_json(409, {"error": "Another import or export is already running."})
                 return
-            temp_dir = None
-            response_started = False
-            try:
-                temp_dir = Path(tempfile.mkdtemp(prefix=".admin-export-", dir=str(STATE.base)))
-                archive = temp_dir / f"{name}.tar.gz"
-                STATE.close_space_terminals(name)
-                STATE.run_action("export", name, str(archive), timeout=3600)
-                if not archive.is_file() or archive.stat().st_size <= 0:
-                    raise RuntimeError("Export did not produce a valid archive")
-                size = archive.stat().st_size
-                self.send_response(200)
-                self.send_header("Content-Type", "application/gzip")
-                self.send_header("Content-Length", str(size))
-                self.send_header("Content-Disposition", f'attachment; filename="{name}.tar.gz"')
-                self.security_headers()
-                self.end_headers()
-                response_started = True
-                with archive.open("rb") as source:
-                    while True:
-                        chunk = source.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-            except (OSError, RuntimeError, ValueError) as exc:
-                # Once streaming begins, a disconnect produces a truncated download;
-                # never append a second HTTP response to the binary archive.
-                if not response_started:
-                    try:
-                        self.send_json(400, {"error": str(exc)[:700]})
-                    except (OSError, BrokenPipeError):
-                        pass
-            finally:
-                if temp_dir is not None:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                STATE.archive_lock.release()
+            export_id = secrets.token_hex(12)
+            filename = name + ".tar.gz"
+            archive = STATE.export_dir / (export_id + ".tar.gz")
+            task = {"id": export_id, "type": "export", "name": name, "filename": filename, "status": "running", "stage": "queued", "stage_label": "Queued for export", "progress": 1, "bytes_written": 0, "size_bytes": 0, "created": time.time(), "updated": time.time(), "error": ""}
+            STATE.add_transfer(task)
+            STATE.save_export_meta(task)
+            worker = threading.Thread(target=STATE.run_export_job, args=(export_id, name, archive, filename), daemon=True)
+            worker.start()
+            self.send_json(202, {"ok": True, "id": export_id, "name": name, "status": "running"})
             return
 
         if parsed.path == "/api/logout":
@@ -1681,6 +2184,8 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "create":
                     if not NAME_RE.fullmatch(name):
                         raise ValueError("Use 1–48 letters, numbers, underscores or hyphens.")
+                    if STATE.import_name_reserved(name):
+                        raise ValueError("An import for that codespace name is already running.")
                     if (STATE.spaces / name).exists():
                         raise ValueError("That codespace already exists.")
                     try:
@@ -4781,7 +5286,7 @@ admin_delete_codespace() {
 admin_export_codespace() {
     local name="$1" export_path="$2" cores tmp_meta_dir unmount=0 was_running=0
     [[ "$name" =~ ^[A-Za-z0-9_-]{1,48}$ && -d "$CODESPACES_DIR/$name" ]] || { echo "Unknown codespace" >&2; return 1; }
-    [[ "$export_path" == "$BASE_DIR"/.admin-export-*/"$name.tar.gz" ]] || { echo "Invalid export destination" >&2; return 1; }
+    [[ "$export_path" == "$BASE_DIR"/admin-exports/*.tar.gz && "${export_path##*/}" =~ ^[a-f0-9]{24}\.tar\.gz$ ]] || { echo "Invalid export destination" >&2; return 1; }
     command -v pigz >/dev/null 2>&1 || { echo "pigz is required for export" >&2; return 1; }
     [[ ! -e "$export_path" ]] || { echo "Export destination already exists" >&2; return 1; }
     if is_running "$name"; then
